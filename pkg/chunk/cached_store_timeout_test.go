@@ -1,18 +1,36 @@
+/*
+ * JuiceFS, Copyright 2026 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package chunk
 
 import (
 	"context"
 	"io"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/stretchr/testify/require"
 )
 
-// slowGetStorage delays Get past GetTimeout so WithTimeout abandons load's closure while it is
-// still running.
+const raceTestKey = "chunks/0/0/1_0_1048576"
+
+// slowGetStorage delays Get past GetTimeout so WithTimeout abandons the caller's closure while it
+// is still running.
 type slowGetStorage struct {
 	object.ObjectStorage
 	delay time.Duration
@@ -27,33 +45,44 @@ func (s *slowGetStorage) Get(ctx context.Context, key string, off, limit int64, 
 	return s.ObjectStorage.Get(ctx, key, off, limit, getters...)
 }
 
-// A GET that outlives GetTimeout leaves load's closure running after load has returned. The
-// closure must not share err, n, reqID or sc with load: writing the error interface while
-// errors.Is reads it tears the interface, and the runtime faults on the torn type word rather
-// than raising a recoverable panic.
-func TestLoadDoesNotRaceWithTimedOutGet(t *testing.T) {
+func newTimingOutStore(t *testing.T) *cachedStore {
+	t.Helper()
 	mem, err := object.CreateStorage("mem", "", "", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := mem.Put(ctx, "chunks/0/0/1_0_1048576", io.LimitReader(fillReader{}, 1<<20)); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+	require.NoError(t, mem.Put(ctx, raceTestKey, io.LimitReader(fillReader{}, 1<<20)))
 
 	conf := defaultConf
-	conf.CacheDir = filepath.Join(os.TempDir(), "raceCache")
+	// The memory cache keeps the disk cache's background scanner out of this test.
+	conf.CacheDir = "memory"
 	conf.GetTimeout = 20 * time.Millisecond
-	_ = os.RemoveAll(conf.CacheDir)
-	defer os.RemoveAll(conf.CacheDir)
+	return NewCachedStore(&slowGetStorage{mem, 120 * time.Millisecond}, conf, nil).(*cachedStore)
+}
 
-	store := NewCachedStore(&slowGetStorage{mem, 120 * time.Millisecond}, conf, nil).(*cachedStore)
-
+// A GET that outlives GetTimeout leaves the closure running after load has returned. The closure
+// must not share err, n, reqID or sc with load: writing the error interface while errors.Is reads
+// it tears the interface, and the runtime faults on the torn type word rather than raising a
+// recoverable panic.
+func TestLoadDoesNotRaceWithTimedOutGet(t *testing.T) {
+	store := newTimingOutStore(t)
 	page := NewOffPage(1 << 20)
 	defer page.Release()
-	if err := store.load(ctx, "chunks/0/0/1_0_1048576", page, false, false); err == nil {
-		t.Fatal("expected load to time out")
-	}
-	// Let the abandoned closure publish its result.
+
+	err := store.load(ctx, raceTestKey, page, false, false)
+	require.ErrorContains(t, err, utils.ErrFuncTimeout.Error())
+
+	// Let the abandoned closure publish its result; it must not reach load's caller.
+	time.Sleep(300 * time.Millisecond)
+}
+
+func TestLoadRangeDoesNotRaceWithTimedOutGet(t *testing.T) {
+	store := newTimingOutStore(t)
+	page := NewOffPage(64 << 10)
+	defer page.Release()
+
+	n, err := store.loadRange(ctx, raceTestKey, page, 0)
+	require.ErrorIs(t, err, errTryFullRead)
+	require.Zero(t, n)
+
 	time.Sleep(300 * time.Millisecond)
 }
 
