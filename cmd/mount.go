@@ -571,7 +571,9 @@ func mount(c *cli.Context) error {
 		if mp == "/" {
 			logger.Fatalf("should not mount on the root directory")
 		}
-		prepareMp(mp)
+		if !vhostUserMode(c) {
+			prepareMp(mp)
+		}
 		if runtime.GOOS == "linux" && c.Bool("update-fstab") && !calledViaMount(os.Args) && !insideContainer() {
 			if os.Getuid() != 0 {
 				logger.Warnf("--update-fstab should be used with root")
@@ -648,7 +650,12 @@ func mount(c *cli.Context) error {
 		} else {
 			foreground = os.Getppid() == 1 && !insideContainer()
 		}
-		if foreground {
+		if vhostUserMode(c) {
+			// Nothing is mounted on the host in vhost-user mode — the guest owns the
+			// mount point — so the readiness watchdog would kill this process once its
+			// timeout expired.
+			logger.Infof("vhost-user mode: skipping mount point readiness check for %q", mp)
+		} else if foreground {
 			go checkMountpoint(format.Name, mp, c.String("log"), false)
 		} else {
 			daemonRun(c, addr, vfsConf) // only stage 0 needs the vfsConf

@@ -50,6 +50,12 @@ func newFileSystem(conf *vfs.Config, v *vfs.VFS) *fileSystem {
 	}
 }
 
+// NewRawFileSystem builds the FUSE request handler for v. Serve() uses it for a
+// /dev/fuse mount; a vhost-user transport drives the same handler over virtqueues.
+func NewRawFileSystem(v *vfs.VFS) fuse.RawFileSystem {
+	return newFileSystem(v.Conf, v)
+}
+
 type setTimeout func(time.Duration)
 
 func (fs *fileSystem) replyAttr(ctx *fuseContext, entry *meta.Entry, attr *fuse.Attr, set setTimeout) {
@@ -252,7 +258,9 @@ func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Op
 		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
 	} else if entry.Attr.KeepCache {
 		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
-	} else {
+	} else if fsserv != nil {
+		// Only a /dev/fuse mount has a server to invalidate through; a vhost-user
+		// transport serves the same filesystem with fsserv unset.
 		if runtime.GOOS == "darwin" {
 			go fsserv.InodeNotify(uint64(in.NodeId), -1, 0)
 		} else {

@@ -423,6 +423,14 @@ func fuseFlags() []cli.Flag {
 			Usage: "enable ioctl (support GETFLAGS/SETFLAGS only)",
 		},
 		&cli.StringFlag{
+			Name:  "vhost-user-socket",
+			Usage: "serve the volume to a VM over vhost-user virtio-fs on this socket instead of mounting it locally",
+		},
+		&cli.BoolFlag{
+			Name:  "vhost-user-dax",
+			Usage: "serve guest reads by mapping into the VM's DAX window (requires --vhost-user-socket)",
+		},
+		&cli.StringFlag{
 			Name:  "root-squash",
 			Usage: "mapping local root user (uid = 0) to another one specified as <uid>:<gid>",
 		},
@@ -1161,6 +1169,13 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 			conf.RootSquash = &vfs.AnonymousAccount{Uid: uid, Gid: gid}
 			logger.Infof("Map root uid/gid 0 to %d/%d by setting root-squash", uid, gid)
 		}
+	}
+	if socket := c.String("vhost-user-socket"); socket != "" {
+		// The guest owns the mount point in this mode, so nothing is mounted here.
+		if err := serveVhostUser(v, socket, c.Bool("vhost-user-dax")); err != nil {
+			logger.Fatalf("vhost-user-fs: %s", err)
+		}
+		return
 	}
 	logger.Infof("Mounting volume %s at %q ...", conf.Format.Name, conf.Meta.MountPoint)
 	err := fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"), c.Bool("enable-ioctl"))
