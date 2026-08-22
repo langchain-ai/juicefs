@@ -18,7 +18,9 @@ package vfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"sort"
 	"sync"
@@ -826,9 +828,19 @@ func (r *dataReader) readSlice(ctx context.Context, s *meta.Slice, page *chunk.P
 		p := page.Slice(read, len(buf)-read)
 		n, err := reader.ReadAt(ctx, p, off+int(s.Off))
 		p.Release()
-		if n == 0 && err != nil {
-			logger.Warningf("fail to read sliceId %d (off:%d, size:%d, clen: %d, inode: %d): %s",
-				s.Id, off+int(s.Off), len(buf)-read, s.Size, ctx.Value(meta.CtxKey("inode")), err)
+		if n == 0 {
+			if err == nil {
+				// No progress and no reason: another turn would read the same range forever.
+				err = io.ErrNoProgress
+			}
+			if errors.Is(err, context.Canceled) {
+				// drop() cancels a slice nobody wants any more, which is routine for read-ahead.
+				logger.Debugf("read of sliceId %d canceled (off:%d, size:%d, clen: %d, inode: %d)",
+					s.Id, off+int(s.Off), len(buf)-read, s.Size, ctx.Value(meta.CtxKey("inode")))
+			} else {
+				logger.Warningf("fail to read sliceId %d (off:%d, size:%d, clen: %d, inode: %d): %s",
+					s.Id, off+int(s.Off), len(buf)-read, s.Size, ctx.Value(meta.CtxKey("inode")), err)
+			}
 			return err
 		}
 		read += n
