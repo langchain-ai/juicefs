@@ -52,9 +52,13 @@ func (con *Controller) Execute(key string, fn func() (*Page, error)) (*Page, err
 	c.val, c.err = fn()
 
 	con.Lock()
-	for i := 0; i < c.dups; i++ {
-		// Acquire for the pending Execute
-		c.val.Acquire()
+	// A failed fetch has no page to hand out. Acquire on a nil page faults the whole process
+	// rather than panicking, because refs is the first field so the atomic add lands on 0x0.
+	if c.val != nil {
+		for i := 0; i < c.dups; i++ {
+			// Acquire for the pending Execute
+			c.val.Acquire()
+		}
 	}
 	delete(con.rs, key)
 	con.Unlock()
