@@ -703,6 +703,15 @@ func logRequest(typeStr, key, param, reqID string, err error, used time.Duration
 
 var errTryFullRead = errors.New("try full read")
 
+// getResult carries a GET's side outputs out of the WithTimeout closure. The closure keeps running
+// after a timeout, so it may only publish under getMu, and the caller may only read its own
+// snapshot taken under the same lock.
+type getResult struct {
+	n     int
+	reqID string
+	sc    string
+}
+
 func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page, off int) (n int, err error) {
 	p := page.Data
 	fullPage, err := store.group.TryPiggyback(key)
@@ -722,27 +731,35 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 
 	start := time.Now()
 	var (
-		reqID string
-		sc    = object.DefaultStorageClass
+		getMu sync.Mutex
+		got   = getResult{sc: object.DefaultStorageClass}
 	)
 	page.Acquire()
 	err = utils.WithTimeout(ctx, func(cCtx context.Context) error {
 		defer page.Release()
-		in, err := store.storage.Get(cCtx, key, int64(off), int64(len(p)), object.WithRequestID(&reqID), object.WithStorageClass(&sc))
+		res := getResult{sc: object.DefaultStorageClass}
+		in, err := store.storage.Get(cCtx, key, int64(off), int64(len(p)), object.WithRequestID(&res.reqID), object.WithStorageClass(&res.sc))
 		if err == nil {
-			n, err = io.ReadFull(in, p)
+			res.n, err = io.ReadFull(in, p)
 			_ = in.Close()
 		}
+		getMu.Lock()
+		got = res
+		getMu.Unlock()
 		return err
 	}, store.conf.GetTimeout)
+	getMu.Lock()
+	res := got
+	getMu.Unlock()
+	n = res.n
 
 	used := time.Since(start)
-	logRequest("GET", key, fmt.Sprintf("RANGE(%d,%d) ", off, len(p)), reqID, err, used)
+	logRequest("GET", key, fmt.Sprintf("RANGE(%d,%d) ", off, len(p)), res.reqID, err, used)
 	if errors.Is(err, context.Canceled) {
 		return 0, err
 	}
-	store.objectDataBytes.WithLabelValues("GET", sc).Add(float64(n))
-	store.objectReqsHistogram.WithLabelValues("GET", sc).Observe(used.Seconds())
+	store.objectDataBytes.WithLabelValues("GET", res.sc).Add(float64(n))
+	store.objectReqsHistogram.WithLabelValues("GET", res.sc).Observe(used.Seconds())
 	if err == nil {
 		store.fetcher.fetch(key)
 		return n, nil
@@ -768,11 +785,7 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 		store.downLimit.Wait(int64(len(page.Data)))
 	}
 	var (
-		in    io.ReadCloser
-		n     int
 		p     *Page
-		reqID string
-		sc    = object.DefaultStorageClass
 		start = time.Now()
 	)
 	if compressed {
@@ -782,30 +795,43 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 	} else {
 		p = page
 	}
+	var (
+		getMu sync.Mutex
+		got   = getResult{sc: object.DefaultStorageClass}
+	)
 	p.Acquire()
 	err = utils.WithTimeout(ctx, func(cCtx context.Context) error {
 		defer p.Release()
+		res := getResult{sc: object.DefaultStorageClass}
 		// it will be retried in the upper layer.
-		in, err = store.storage.Get(cCtx, key, 0, -1, object.WithRequestID(&reqID), object.WithStorageClass(&sc))
+		in, err := store.storage.Get(cCtx, key, 0, -1, object.WithRequestID(&res.reqID), object.WithStorageClass(&res.sc))
 		if err == nil {
-			n, err = io.ReadFull(in, p.Data)
+			res.n, err = io.ReadFull(in, p.Data)
 			_ = in.Close()
 		}
 		if compressed && err == io.ErrUnexpectedEOF {
 			err = nil
 		}
+		getMu.Lock()
+		got = res
+		getMu.Unlock()
 		return err
 	}, store.conf.GetTimeout)
+	getMu.Lock()
+	res := got
+	getMu.Unlock()
+	n := res.n
+
 	if errors.Is(err, context.Canceled) {
 		return err
 	}
 	used := time.Since(start)
-	logRequest("GET", key, "", reqID, err, used)
+	logRequest("GET", key, "", res.reqID, err, used)
 	if store.downLimit != nil && compressed {
 		store.downLimit.Wait(int64(n))
 	}
-	store.objectDataBytes.WithLabelValues("GET", sc).Add(float64(n))
-	store.objectReqsHistogram.WithLabelValues("GET", sc).Observe(used.Seconds())
+	store.objectDataBytes.WithLabelValues("GET", res.sc).Add(float64(n))
+	store.objectReqsHistogram.WithLabelValues("GET", res.sc).Observe(used.Seconds())
 	if err != nil {
 		store.objectReqErrors.Add(1)
 		return fmt.Errorf("get %s: %s", key, err)
