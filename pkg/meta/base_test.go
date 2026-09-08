@@ -1749,6 +1749,29 @@ func testCaseIncensiHardlinkRename(t *testing.T, m Meta) {
 	}
 }
 
+func TestShouldStartWriteCompaction(t *testing.T) {
+	tests := []struct {
+		name      string
+		numSlices int
+		want      bool
+	}{
+		{name: "old interval boundary", numSlices: 99, want: false},
+		{name: "before treatment interval", numSlices: 198, want: false},
+		{name: "treatment interval boundary", numSlices: 199, want: true},
+		{name: "after treatment interval", numSlices: 200, want: false},
+		{name: "at debt threshold", numSlices: 350, want: false},
+		{name: "above debt threshold", numSlices: 351, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldStartWriteCompaction(tt.numSlices); got != tt.want {
+				t.Fatalf("shouldStartWriteCompaction(%d) = %t, want %t", tt.numSlices, got, tt.want)
+			}
+		})
+	}
+}
+
 type compactor interface {
 	compactChunk(inode Ino, indx uint32, once, force bool, tierID int)
 }
