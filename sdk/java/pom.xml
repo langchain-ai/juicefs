@@ -10,7 +10,7 @@
 	<version>1.5-dev</version>
 	<packaging>jar</packaging>
 	<properties>
-		<hadoop.version>3.4.0</hadoop.version>
+		<hadoop.version>3.2.4</hadoop.version>
 		<avro.version>1.11.4</avro.version>
 		<derby.version>10.17.1.0</derby.version>
 		<zookeeper.version>3.8.3</zookeeper.version>
