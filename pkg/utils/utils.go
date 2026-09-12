@@ -108,14 +108,11 @@ func FindLocalIPs(allowedInterfaces ...string) ([]net.IP, error) {
 }
 
 func WithTimeout(pCtx context.Context, f func(context.Context) error, timeout time.Duration) error {
-	// The timeout and cancel paths return while f is still running, so the result travels by
-	// channel: a shared variable would be written by the abandoned goroutine while this one
-	// returns it, and a torn error interface faults the process instead of panicking.
-	var done = make(chan error, 1)
-	var t = time.NewTimer(timeout)
-	defer t.Stop()
+	done := make(chan error, 1)
+	t := time.NewTimer(timeout)
 	ctx, cancel := context.WithCancel(pCtx)
 	defer cancel()
+	defer t.Stop()
 	go func() {
 		done <- f(ctx)
 	}()

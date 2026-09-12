@@ -20,13 +20,16 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1274,6 +1277,102 @@ func TestSyncEncryptLargeFile(t *testing.T) {
 	}
 }
 
+type progressReaderFunc func([]byte) (int, error)
+
+func (f progressReaderFunc) Read(b []byte) (int, error) { return f(b) }
+
+func TestWithProgressLimitsActualBytes(t *testing.T) {
+	const readSize = 1 << 20
+	local := ratelimit.NewBucket(time.Hour, 2*readSize)
+	oldLimiter, oldCopiedBytes := limiter, copiedBytes
+	limiter, copiedBytes = &mixedLimiter{local: local}, nil
+	t.Cleanup(func() { limiter, copiedBytes = oldLimiter, oldCopiedBytes })
+
+	data := []byte("abc")
+	source := bytes.NewReader(data)
+	readErr := errors.New("source read failed")
+	wantTokens := int64(2*readSize - len(data))
+	r := newProgressReader(progressReaderFunc(func(b []byte) (int, error) {
+		if got := local.Available(); got != wantTokens {
+			t.Fatalf("tokens before source read: got %d, want %d", got, wantTokens)
+		}
+		n, err := source.Read(b[:1])
+		if source.Len() == 0 && n > 0 {
+			err = readErr
+		}
+		return n, err
+	}), int64(len(data)))
+	b := make([]byte, readSize)
+	for _, wantErr := range []error{nil, nil, readErr} {
+		if n, err := r.Read(b); n != 1 || err != wantErr {
+			t.Fatalf("read: got (%d, %v), want (1, %v)", n, err, wantErr)
+		}
+	}
+	if n, err := r.Read(b); n != 0 || err != io.EOF {
+		t.Fatalf("final read: got (%d, %v), want (0, EOF)", n, err)
+	}
+	if got := local.Available(); got != wantTokens {
+		t.Fatalf("tokens after EOF: got %d, want %d", got, wantTokens)
+	}
+}
+
+func TestCopyLimitsSmallObject(t *testing.T) {
+	const readSize = 1 << 20
+	cases := []struct {
+		name string
+		body string
+		size int64
+		// wantTokens is the exact reservation expected, or -1 when the size is
+		// unknown and only the copied content matters.
+		wantTokens int64
+	}{
+		{"empty", "", 0, 0},
+		{"tiny", "x", 1, 1},
+		{"unknownSize", "hello", -1, -1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			local := ratelimit.NewBucket(time.Hour, 2*readSize)
+			oldLimiter, oldCopiedBytes := limiter, copiedBytes
+			limiter, copiedBytes = &mixedLimiter{local: local}, nil
+			t.Cleanup(func() { limiter, copiedBytes = oldLimiter, oldCopiedBytes })
+
+			src, err := object.CreateStorage("mem", "", "", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			dst, err := object.CreateStorage("file", t.TempDir()+"/", "", "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := src.Put(ctx, "key", strings.NewReader(c.body)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := doCopySingle0(src, dst, "key", c.size, false); err != nil {
+				t.Fatal(err)
+			}
+
+			in, err := dst.Get(ctx, "key", 0, -1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer in.Close()
+			got, err := io.ReadAll(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != c.body {
+				t.Fatalf("copied content: got %q, want %q", got, c.body)
+			}
+			if c.wantTokens >= 0 {
+				if used := int64(2*readSize) - local.Available(); used != c.wantTokens {
+					t.Fatalf("reserved tokens: got %d, want %d", used, c.wantTokens)
+				}
+			}
+		})
+	}
+}
+
 // TestMixedLimiterFailover verifies that the global traffic control takes
 // precedence, falls back to the local bwlimit when the global service is
 // unavailable, and switches back to the global limit once it recovers.
@@ -1400,5 +1499,49 @@ func TestGlobalLimitDrainWaitersOnFailure(t *testing.T) {
 	}
 	if g.healthy.Load() {
 		t.Fatalf("expected global limit to be marked unhealthy")
+	}
+}
+
+func TestCopyDataWithoutProgress(t *testing.T) {
+	savedCopied, savedCopiedBytes := copied, copiedBytes
+	copied, copiedBytes = nil, nil
+	defer func() { copied, copiedBytes = savedCopied, savedCopiedBytes }()
+
+	src, err := object.CreateStorage("mem", "", "", "", "")
+	if err != nil {
+		t.Fatalf("create src: %s", err)
+	}
+	dst, err := object.CreateStorage("mem", "", "", "", "")
+	if err != nil {
+		t.Fatalf("create dst: %s", err)
+	}
+	data := bytes.Repeat([]byte("juicefs"), 50)
+	if err = src.Put(ctx, "backup", bytes.NewReader(data)); err != nil {
+		t.Fatalf("put: %s", err)
+	}
+	wantChksum := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
+
+	settleGoroutines := func() {
+		runtime.GC()
+		time.Sleep(300 * time.Millisecond)
+		runtime.GC()
+	}
+	settleGoroutines()
+	base := runtime.NumGoroutine()
+
+	const cycles = 50
+	for i := 0; i < cycles; i++ {
+		chksum, err := CopyData(src, dst, "backup", int64(len(data)), true)
+		if err != nil {
+			t.Fatalf("CopyData: %s", err)
+		}
+		if chksum != wantChksum {
+			t.Fatalf("checksum mismatch: got %d, want %d", chksum, wantChksum)
+		}
+	}
+
+	settleGoroutines()
+	if leaked := runtime.NumGoroutine() - base; leaked > cycles/10 {
+		t.Fatalf("leaked %d goroutines after %d CopyData calls", leaked, cycles)
 	}
 }

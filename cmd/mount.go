@@ -562,8 +562,9 @@ func mount(c *cli.Context) error {
 	var err error
 	if stage == 0 || supervisor == "test" {
 		err = utils.WithTimeout(context.TODO(), func(context.Context) error {
-			mp, err = filepath.Abs(mp)
-			return err
+			var pathErr error
+			mp, pathErr = filepath.Abs(mp)
+			return pathErr
 		}, time.Second*3)
 		if err != nil {
 			logger.Fatalf("abs %q: %s", mp, err)

@@ -44,12 +44,12 @@ type stubChunkStore struct {
 	reader chunk.Reader
 }
 
-func (s *stubChunkStore) NewReader(id uint64, length int) chunk.Reader   { return s.reader }
-func (s *stubChunkStore) NewWriter(id uint64, tierID uint8) chunk.Writer { return nil }
-func (s *stubChunkStore) Remove(id uint64, length int) error             { return nil }
-func (s *stubChunkStore) FillCache(id uint64, length uint32) error       { return nil }
-func (s *stubChunkStore) EvictCache(id uint64, length uint32) error      { return nil }
-func (s *stubChunkStore) CheckCache(id uint64, length uint32, handler func(bool, string, int)) error {
+func (s *stubChunkStore) NewReader(id uint64, length int) chunk.Reader                   { return s.reader }
+func (s *stubChunkStore) NewWriter(id uint64, tierID uint8) chunk.Writer                 { return nil }
+func (s *stubChunkStore) Remove(id uint64, length int) error                             { return nil }
+func (s *stubChunkStore) FillCache(id uint64, length uint32, parts []chunk.Range) error  { return nil }
+func (s *stubChunkStore) EvictCache(id uint64, length uint32, parts []chunk.Range) error { return nil }
+func (s *stubChunkStore) CheckCache(id uint64, length uint32, parts []chunk.Range, handler func(bool, string, int)) error {
 	return nil
 }
 func (s *stubChunkStore) UsedMemory() int64                  { return 0 }

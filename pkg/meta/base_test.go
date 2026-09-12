@@ -181,6 +181,8 @@ func testMeta(t *testing.T, m Meta) {
 	testLocks(t, m)
 	testListLocks(t, m)
 	testConcurrentWrite(t, m)
+	testRace(t, m)
+	testXattr(t, m)
 	testCompaction(t, m, false)
 	time.Sleep(time.Second)
 	testCompaction(t, m, true)
@@ -210,6 +212,25 @@ func testMeta(t *testing.T, m Meta) {
 	testKerberosToken(t, m)
 	base.conf.ReadOnly = true
 	testReadOnly(t, m)
+}
+
+func testXattr(t *testing.T, m Meta) {
+	t.Run("XattrInodeLifecycle", func(t *testing.T) {
+		ctx := Background()
+		var inode Ino
+		if st := m.Mknod(ctx, RootInode, "xattr-inode-lifecycle", TypeFile, 0644, 022, 0, "", &inode, nil); st != 0 {
+			t.Fatalf("mknod: %s", st)
+		}
+		if st := m.Unlink(ctx, RootInode, "xattr-inode-lifecycle"); st != 0 {
+			t.Fatalf("unlink: %s", st)
+		}
+		if st := m.SetXattr(ctx, inode, "user.test", []byte("orphan"), XattrCreateOrReplace); st != syscall.ENOENT {
+			t.Fatalf("setxattr after unlink: got %s, want %s", st, syscall.ENOENT)
+		}
+		if st := m.RemoveXattr(ctx, inode, "user.test"); st != syscall.ENOENT {
+			t.Fatalf("removexattr after unlink: got %s, want %s", st, syscall.ENOENT)
+		}
+	})
 }
 
 func testAccess(t *testing.T, m Meta) {
@@ -1950,7 +1971,10 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 	_ = m.Write(ctx, inode, 0, uint32(0), Slice{Id: sliceId, Size: 1 << 20, Len: 64 << 10}, time.Now())
 	m.NewSlice(ctx, &sliceId)
 	_ = m.Write(ctx, inode, 0, uint32(128<<10), Slice{Id: sliceId, Size: 2 << 20, Len: 128 << 10}, time.Now())
-	_ = m.Write(ctx, inode, 0, uint32(0), Slice{Id: 0, Size: 1 << 20, Len: 1 << 20}, time.Now())
+	m.NewSlice(ctx, &sliceId)
+	if st := m.Write(ctx, inode, 0, uint32(0), Slice{Id: sliceId, Size: 1 << 20, Len: 1 << 20}, time.Now()); st != 0 {
+		t.Fatalf("write 0: %s", st)
+	}
 	if c, ok := m.(compactor); ok {
 		c.compactChunk(inode, 0, false, true, 0)
 	}
@@ -2062,6 +2086,268 @@ func testConcurrentWrite(t *testing.T, m Meta) {
 	g2.Wait()
 	if errno != 0 {
 		t.Fatal()
+	}
+}
+
+func testRace(t *testing.T, m Meta) {
+	t.Run("TrashSliceClaim", func(t *testing.T) {
+		testTrashSliceClaimRace(t, m)
+	})
+	t.Run("SQLExactEdgeCAS", func(t *testing.T) {
+		db, ok := m.(*dbMeta)
+		if !ok {
+			t.Skip("SQL transaction invariant")
+		}
+		testSQLExactEdgeCAS(t, db)
+	})
+}
+
+func testSQLExactEdgeCAS(t *testing.T, m *dbMeta) {
+	insert := func(e *edge) {
+		t.Helper()
+		if _, err := m.db.Insert(e); err != nil {
+			t.Fatalf("insert edge %q: %s", e.Name, err)
+		}
+		if e.Id == 0 {
+			t.Fatalf("insert edge %q returned zero id", e.Name)
+		}
+	}
+	remove := func(id int64) {
+		t.Helper()
+		if _, err := m.db.ID(id).Delete(&edge{}); err != nil {
+			t.Errorf("remove edge %d: %s", id, err)
+		}
+	}
+	get := func(id int64) edge {
+		t.Helper()
+		var e edge
+		ok, err := m.db.ID(id).Get(&e)
+		if err != nil {
+			t.Fatalf("get edge %d: %s", id, err)
+		}
+		if !ok {
+			t.Fatalf("edge %d not found", id)
+		}
+		return e
+	}
+
+	t.Run("DeleteRejectsChangedIdentity", func(t *testing.T) {
+		original := edge{Parent: RootInode, Name: []byte("sql-c05-changed"), Inode: 101, Type: TypeFile}
+		insert(&original)
+		defer remove(original.Id)
+		stale := get(original.Id)
+		if n, err := m.db.ID(original.Id).Cols("inode", "type").Update(&edge{Inode: 102, Type: TypeSymlink}); err != nil || n != 1 {
+			t.Fatalf("replace edge identity: rows=%d err=%v", n, err)
+		}
+
+		_, err := m.db.Transaction(func(s *xorm.Session) (interface{}, error) { return nil, deleteEdge(s, &stale) })
+		if !errors.Is(err, errEdgeChanged) {
+			t.Fatalf("delete stale edge: got %v, want %v", err, errEdgeChanged)
+		}
+		current := get(original.Id)
+		if current.Inode != 102 || current.Type != TypeSymlink {
+			t.Fatalf("replacement edge changed: inode=%d type=%d", current.Inode, current.Type)
+		}
+	})
+
+	t.Run("UpdateRejectsABAIdentity", func(t *testing.T) {
+		original := edge{Parent: RootInode, Name: []byte("sql-c05-aba"), Inode: 201, Type: TypeFile}
+		insert(&original)
+		stale := get(original.Id)
+		if n, err := m.db.ID(original.Id).Delete(&edge{}); err != nil || n != 1 {
+			t.Fatalf("delete original edge: rows=%d err=%v", n, err)
+		}
+		replacement := edge{Parent: original.Parent, Name: original.Name, Inode: original.Inode, Type: original.Type}
+		insert(&replacement)
+		defer remove(replacement.Id)
+
+		_, err := m.db.Transaction(func(s *xorm.Session) (interface{}, error) {
+			return nil, updateEdge(s, &stale, &edge{Inode: 202, Type: TypeSymlink})
+		})
+		if !errors.Is(err, errEdgeChanged) {
+			t.Fatalf("update ABA edge: got %v, want %v", err, errEdgeChanged)
+		}
+		current := get(replacement.Id)
+		if current.Inode != original.Inode || current.Type != original.Type {
+			t.Fatalf("ABA replacement changed: inode=%d type=%d", current.Inode, current.Type)
+		}
+	})
+
+	t.Run("BatchAffectedRowsRollback", func(t *testing.T) {
+		first := edge{Parent: RootInode, Name: []byte("sql-c05-batch-first"), Inode: 301, Type: TypeFile}
+		second := edge{Parent: RootInode, Name: []byte("sql-c05-batch-second"), Inode: 302, Type: TypeFile}
+		insert(&first)
+		defer remove(first.Id)
+		insert(&second)
+		defer remove(second.Id)
+		stale := []edge{get(first.Id), get(second.Id)}
+		if n, err := m.db.ID(second.Id).Cols("inode").Update(&edge{Inode: 303}); err != nil || n != 1 {
+			t.Fatalf("replace batch edge identity: rows=%d err=%v", n, err)
+		}
+
+		_, err := m.db.Transaction(func(s *xorm.Session) (interface{}, error) { return nil, deleteEdges(s, stale) })
+		if !errors.Is(err, errEdgeChanged) {
+			t.Fatalf("delete stale edge batch: got %v, want %v", err, errEdgeChanged)
+		}
+		if current := get(first.Id); current.Inode != first.Inode {
+			t.Fatalf("first edge deletion was not rolled back: inode=%d", current.Inode)
+		}
+		if current := get(second.Id); current.Inode != 303 {
+			t.Fatalf("second replacement changed: inode=%d", current.Inode)
+		}
+	})
+}
+
+func testTrashSliceClaimRace(t *testing.T, m Meta) {
+	format := testFormat()
+	format.TrashDays = 1
+	if err := m.Init(format, false); err != nil {
+		t.Fatalf("init meta with trash: %v", err)
+	}
+	defer func() {
+		if err := m.Init(testFormat(), false); err != nil {
+			t.Fatalf("restore meta format: %v", err)
+		}
+	}()
+
+	if err := m.NewSession(false); err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	defer m.CloseSession()
+
+	ctx := Background()
+	_ = m.Unlink(ctx, RootInode, "race")
+	var inode Ino
+	if st := m.Create(ctx, RootInode, "race", 0650, 022, 0, &inode, nil); st != 0 {
+		t.Fatalf("create file: %s", st)
+	}
+	defer m.Unlink(ctx, RootInode, "race")
+
+	const sliceSize = 100
+	var liveSlice, delayedSlice uint64
+	if st := m.NewSlice(ctx, &liveSlice); st != 0 {
+		t.Fatalf("new live slice: %s", st)
+	}
+	if st := m.Write(ctx, inode, 0, 0, Slice{Id: liveSlice, Size: sliceSize, Len: sliceSize}, time.Now()); st != 0 {
+		t.Fatalf("write live slice: %s", st)
+	}
+	if st := m.NewSlice(ctx, &delayedSlice); st != 0 {
+		t.Fatalf("new delayed slice: %s", st)
+	}
+	if st := m.Write(ctx, inode, 0, sliceSize, Slice{Id: delayedSlice, Size: sliceSize, Len: sliceSize}, time.Now()); st != 0 {
+		t.Fatalf("write delayed slice: %s", st)
+	}
+	var copied uint64
+	if st := m.CopyFileRange(ctx, inode, 0, inode, ChunkSize, sliceSize, 0, &copied, nil); st != 0 {
+		t.Fatalf("copy live slice: %s", st)
+	} else if copied != sliceSize {
+		t.Fatalf("copied bytes: got %d, want %d", copied, sliceSize)
+	}
+
+	var mu sync.Mutex
+	deletedLive := 0
+	m.OnMsg(DeleteSlice, func(args ...interface{}) error {
+		if args[0].(uint64) == liveSlice {
+			mu.Lock()
+			deletedLive++
+			mu.Unlock()
+		}
+		return nil
+	})
+	m.OnMsg(CompactChunk, func(args ...interface{}) error { return nil })
+	compactor, ok := m.(compactor)
+	if !ok {
+		t.Fatalf("meta %s does not support compaction", m.Name())
+	}
+	compactor.compactChunk(inode, 0, false, true, 0)
+
+	var live []Slice
+	if st := m.Read(ctx, inode, 1, &live); st != 0 {
+		t.Fatalf("read live slice: %s", st)
+	}
+	if len(live) != 1 || live[0].Id != liveSlice {
+		t.Fatalf("live slice after compaction: got %+v, want %d", live, liveSlice)
+	}
+
+	base := m.getBase()
+	base.stopDeleteSliceTasks()
+	defer base.startDeleteSliceTasks()
+
+	ready := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseScanners := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseScanners()
+	scan := func(ss []Slice, _ int64) (bool, error) {
+		for _, s := range ss {
+			if s.Id == liveSlice {
+				select {
+				case ready <- struct{}{}:
+				default:
+				}
+				<-release
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() { errs <- m.ScanDeletedObject(ctx, scan, nil, nil, nil) }()
+	}
+	select {
+	case <-ready:
+	case err := <-errs:
+		t.Fatalf("scan returned before loading delayed slice: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for delayed slice scan")
+	}
+
+	concurrent := false
+	wait := time.Second
+	if m.Name() == "mysql" || m.Name() == "postgres" {
+		wait = 10 * time.Second
+	}
+	select {
+	case <-ready:
+		concurrent = true
+	case <-time.After(wait):
+	}
+	releaseScanners()
+	for range 2 {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("scan trash slices: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for trash slice scanners")
+		}
+	}
+	if (m.Name() == "mysql" || m.Name() == "postgres") && !concurrent {
+		t.Fatalf("meta %s did not run concurrent delayed-slice transactions", m.Name())
+	}
+
+	mu.Lock()
+	deletes := deletedLive
+	mu.Unlock()
+	if deletes != 0 {
+		t.Fatalf("live slice %d was deleted %d times", liveSlice, deletes)
+	}
+	remaining := 0
+	if err := m.ScanDeletedObject(ctx, func(ss []Slice, _ int64) (bool, error) {
+		for _, s := range ss {
+			if s.Id == liveSlice {
+				remaining++
+			}
+		}
+		return false, nil
+	}, nil, nil, nil); err != nil {
+		t.Fatalf("scan remaining trash slices: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("live slice remains in %d delayed entries", remaining)
 	}
 }
 
@@ -3229,6 +3515,85 @@ func testDirStat(t *testing.T, m Meta) {
 		return m.GetDirStat(Background(), testInode)
 	}); err != nil {
 		t.Fatalf("test dir usage rmdir: %v", err)
+	}
+
+	// test BatchUnlink with duplicate hardlink names
+	dupFileName := "batch-dup-file"
+	dupLinkName := "batch-dup-link"
+	dupFileLength := uint64(4097)
+	var dupInode Ino
+	if st := m.Create(Background(), testInode, dupFileName, 0640, 022, 0, &dupInode, nil); st != 0 {
+		t.Fatalf("create duplicate batch file: %s", st)
+	}
+	if st := m.Fallocate(Background(), dupInode, 0, 0, dupFileLength, nil); st != 0 {
+		t.Fatalf("fallocate duplicate batch file: %s", st)
+	}
+	if st := m.Link(Background(), dupInode, testInode, dupLinkName, nil); st != 0 {
+		t.Fatalf("link duplicate batch file: %s", st)
+	}
+	if err := waitCheckResult(m, dirStat{2 * int64(dupFileLength), 2 * align4K(dupFileLength), 2}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage duplicate batch link: %v", err)
+	}
+
+	var dupLinkInode Ino
+	var dupLinkAttr Attr
+	if st := m.Lookup(Background(), testInode, dupLinkName, &dupLinkInode, &dupLinkAttr, false); st != 0 {
+		t.Fatalf("lookup duplicate batch link: %s", st)
+	}
+	if dupLinkInode != dupInode || dupLinkAttr.Nlink != 2 {
+		t.Fatalf("duplicate batch link attr: inode %d attr %+v", dupLinkInode, dupLinkAttr)
+	}
+	dupEntries := []*Entry{
+		{Inode: dupInode, Name: []byte(dupLinkName), Attr: &dupLinkAttr},
+		{Inode: dupInode, Name: []byte(dupLinkName), Attr: &dupLinkAttr},
+	}
+	var dupCount uint64
+	if st := m.getBase().BatchUnlink(Background(), testInode, dupEntries, &dupCount, true); st != 0 {
+		t.Fatalf("batch unlink duplicate hardlink: %s", st)
+	}
+	if dupCount != uint64(len(dupEntries)) {
+		t.Fatalf("batch unlink duplicate count: expect %d, got %d", len(dupEntries), dupCount)
+	}
+	if err := waitCheckResult(m, dirStat{int64(dupFileLength), align4K(dupFileLength), 1}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage duplicate batch unlink: %v", err)
+	}
+
+	var remainingInode Ino
+	var remainingAttr Attr
+	if st := m.Lookup(Background(), testInode, dupFileName, &remainingInode, &remainingAttr, false); st != 0 {
+		t.Fatalf("lookup remaining hardlink after duplicate batch unlink: %s", st)
+	}
+	if remainingInode != dupInode || remainingAttr.Nlink != 1 {
+		t.Fatalf("remaining hardlink attr: inode %d attr %+v", remainingInode, remainingAttr)
+	}
+	var removedInode Ino
+	var removedAttr Attr
+	if st := m.Lookup(Background(), testInode, dupLinkName, &removedInode, &removedAttr, false); st != syscall.ENOENT {
+		t.Fatalf("lookup removed duplicate hardlink: %s", st)
+	}
+	deleted := false
+	if err := m.ScanDeletedObject(Background(), nil, nil, nil, func(ino Ino, size uint64, ts int64) (bool, error) {
+		if ino == dupInode {
+			deleted = true
+		}
+		return false, nil
+	}); err != nil {
+		t.Fatalf("scan pending deleted files: %s", err)
+	}
+	if deleted {
+		t.Fatalf("inode %d was queued for deletion after duplicate batch unlink", dupInode)
+	}
+	if st := m.Unlink(Background(), testInode, dupFileName); st != 0 {
+		t.Fatalf("unlink duplicate batch file: %s", st)
+	}
+	if err := waitCheckResult(m, dirStat{0, 0, 0}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage duplicate batch cleanup: %v", err)
 	}
 }
 
