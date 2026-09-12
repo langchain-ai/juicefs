@@ -80,7 +80,7 @@ func TestLoadRangeDoesNotRaceWithTimedOutGet(t *testing.T) {
 	defer page.Release()
 
 	n, err := store.loadRange(ctx, raceTestKey, page, 0)
-	require.ErrorIs(t, err, errTryFullRead)
+	require.ErrorIs(t, err, utils.ErrFuncTimeout)
 	require.Zero(t, n)
 
 	time.Sleep(300 * time.Millisecond)

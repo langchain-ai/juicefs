@@ -698,10 +698,10 @@ func canShutdownGracefully(mp string, newConf *vfs.Config) bool {
 		return false
 	}
 	var ino uint64
-	var err error
-	err = utils.WithTimeout(context.TODO(), func(context.Context) error {
-		ino, err = utils.GetFileInode(mp)
-		return err
+	err := utils.WithTimeout(context.TODO(), func(context.Context) error {
+		var getErr error
+		ino, getErr = utils.GetFileInode(mp)
+		return getErr
 	}, time.Second*3)
 	if err != nil {
 		logger.Warnf("get inode of %q: %s", mp, err)
@@ -977,7 +977,9 @@ func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorag
 }
 func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
 	increaseRlimit()
-	utils.AdjustOOMKiller(-1000)
+	if os.Getenv("JFS_INSIDE_CONTAINER") != "1" {
+		utils.AdjustOOMKiller(-1000)
+	}
 	utils.SetIOFlusher()
 
 	if c.Bool("disable-transparent-hugepage") {

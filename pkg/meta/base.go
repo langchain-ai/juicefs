@@ -645,6 +645,14 @@ func logEncode2(name string) string {
 	return logEncode([]byte(name))
 }
 
+func logGids(ctx Context) string {
+	gids := make([]string, len(ctx.Gids()))
+	for i, gid := range ctx.Gids() {
+		gids[i] = strconv.FormatUint(uint64(gid), 10)
+	}
+	return strings.Join(gids, ":")
+}
+
 func (m *baseMeta) checkRoot(inode Ino) Ino {
 	switch inode {
 	case 0:
@@ -1178,22 +1186,21 @@ func (m *baseMeta) StatFS(ctx Context, ino Ino, totalspace, availspace, iused, i
 
 func (m *baseMeta) statRootFs(ctx Context, totalspace, availspace, iused, iavail *uint64) syscall.Errno {
 	used, inodes := atomic.LoadInt64(&m.usedSpace), atomic.LoadInt64(&m.usedInodes)
-	var err error
 	if !m.conf.FastStatfs || used == unknownUsage || inodes == unknownUsage {
-		var remoteUsed int64 // using an additional variable here to ensure the assignment inside `utils.WithTimeout` does not change the `used` variable again after a timeout.
-		err = utils.WithTimeout(ctx, func(context.Context) error {
-			remoteUsed, err = m.en.getCounter(usedSpace)
-			return err
-		}, time.Millisecond*150)
-		if err == nil {
+		var remoteUsed int64 // avoid race
+		if err := utils.WithTimeout(ctx, func(context.Context) error {
+			var getErr error
+			remoteUsed, getErr = m.en.getCounter(usedSpace)
+			return getErr
+		}, time.Millisecond*150); err == nil {
 			used = remoteUsed
 		}
 		var remoteInodes int64
-		err = utils.WithTimeout(ctx, func(context.Context) error {
-			remoteInodes, err = m.en.getCounter(totalInodes)
-			return err
-		}, time.Millisecond*150)
-		if err == nil {
+		if err := utils.WithTimeout(ctx, func(context.Context) error {
+			var getErr error
+			remoteInodes, getErr = m.en.getCounter(totalInodes)
+			return getErr
+		}, time.Millisecond*150); err == nil {
 			inodes = remoteInodes
 		}
 	}
@@ -1454,11 +1461,12 @@ func (m *baseMeta) GetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 	if inode == RootInode || inode == TrashInode {
 		// doGetAttr could overwrite the `attr` after timeout
 		var a Attr
+		var attrErr syscall.Errno
 		e := utils.WithTimeout(ctx, func(context.Context) error {
-			err = m.en.doGetAttr(ctx, inode, &a)
+			attrErr = m.en.doGetAttr(ctx, inode, &a)
 			return nil
 		}, time.Millisecond*300)
-		if e == nil && err == 0 {
+		if e == nil && attrErr == 0 {
 			*attr = a
 		} else {
 			err = 0

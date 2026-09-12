@@ -1761,7 +1761,9 @@ func (m *redisMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, s
 	var _type uint8
 	var opened bool
 	var newSpace, newInode int64
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		trash = requestedTrash
 		opened = false
 		*attr = Attr{}
 		newSpace, newInode = 0, 0
@@ -1988,6 +1990,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 			if err != nil {
 				return err
 			}
+			seenNames := make(map[string]struct{}, len(batch))
 			for idx, entry := range batch {
 				val := vals[idx]
 				if val == nil {
@@ -1998,8 +2001,13 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 				if entry.Inode != ino || typ == TypeDirectory || (entry.Attr != nil && entry.Attr.Typ != typ) {
 					continue
 				}
+				name := string(entry.Name)
+				if _, ok := seenNames[name]; ok {
+					continue
+				}
+				seenNames[name] = struct{}{}
 				entryInfos = append(entryInfos, &entryInfo{
-					name:  string(entry.Name),
+					name:  name,
 					inode: ino,
 					typ:   typ,
 					trash: trash,
@@ -2301,7 +2309,9 @@ func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, o
 		}
 	}
 	var attr Attr
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		trash = requestedTrash
 		buf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
 		if err == redis.Nil && m.conf.CaseInsensi {
 			if e := m.resolveCase(ctx, parent, name); e != nil {
@@ -2432,7 +2442,9 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			return st
 		}
 	}
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		trash = requestedTrash
 		opened = false
 		dino, dtyp = 0, 0
 		tattr = Attr{}
@@ -2488,16 +2500,8 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 		if err := tx.Watch(ctx, keys...).Err(); err != nil {
 			return err
 		}
-		if dino > 0 {
-			if ino == dino {
-				return errno(nil)
-			}
-			if exchange {
-			} else if typ == TypeDirectory && dtyp != TypeDirectory {
-				return syscall.ENOTDIR
-			} else if typ != TypeDirectory && dtyp == TypeDirectory {
-				return syscall.EISDIR
-			}
+		if dino > 0 && ino == dino {
+			return errno(nil)
 		}
 
 		keys = []string{m.inodeKey(parentSrc), m.inodeKey(parentDst), m.inodeKey(ino)}
@@ -2540,6 +2544,15 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 		if parentSrc != parentDst && sattr.Mode&0o1000 != 0 && ctx.Uid() != 0 &&
 			ctx.Uid() != iattr.Uid && (ctx.Uid() != sattr.Uid || iattr.Typ == TypeDirectory) {
 			return syscall.EACCES
+		}
+		if dino > 0 && !exchange {
+			if ctx.Uid() != 0 && sattr.Mode&01000 != 0 && ctx.Uid() != sattr.Uid && ctx.Uid() != iattr.Uid {
+				return syscall.EACCES
+			} else if typ == TypeDirectory && dtyp != TypeDirectory {
+				return syscall.ENOTDIR
+			} else if typ != TypeDirectory && dtyp == TypeDirectory {
+				return syscall.EISDIR
+			}
 		}
 
 		var supdate, dupdate bool
@@ -3427,7 +3440,7 @@ func (m *redisMeta) doGetDirStat(ctx Context, ino Ino, trySync bool) (*dirStat, 
 		return nil, errno(errSpace)
 	}
 	usedInodes, errInodes := m.rdb.HGet(ctx, m.dirUsedInodesKey(), field).Int64()
-	if errInodes != nil && errSpace != redis.Nil {
+	if errInodes != nil && errInodes != redis.Nil {
 		return nil, errno(errInodes)
 	}
 	if errLength != redis.Nil && errSpace != redis.Nil && errInodes != redis.Nil {
@@ -4307,11 +4320,19 @@ func (m *redisMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Err
 }
 
 func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
-	key := m.xattrKey(inode)
+	inodeKey := m.inodeKey(inode)
+	xattrKey := m.xattrKey(inode)
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+		exists, err := tx.Exists(ctx, inodeKey).Result()
+		if err != nil {
+			return err
+		}
+		if exists == 0 {
+			return syscall.ENOENT
+		}
 		switch flags {
 		case XattrCreate:
-			ok, err := tx.HExists(ctx, key, name).Result()
+			ok, err := tx.HExists(ctx, xattrKey, name).Result()
 			if err != nil {
 				return err
 			}
@@ -4319,7 +4340,7 @@ func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte
 				return syscall.EEXIST
 			}
 		case XattrReplace:
-			ok, err := tx.HExists(ctx, key, name).Result()
+			ok, err := tx.HExists(ctx, xattrKey, name).Result()
 			if err != nil {
 				return err
 			}
@@ -4327,20 +4348,29 @@ func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte
 				return ENOATTR
 			}
 		}
-		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.HSet(ctx, key, name, value)
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.HSet(ctx, xattrKey, name, value)
 			m.genLog(ctx, pipe, time.Now(), "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
 			return nil
 		})
 		return err
-	}, key))
+	}, inodeKey, xattrKey))
 }
 
 func (m *redisMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
+	inodeKey := m.inodeKey(inode)
+	xattrKey := m.xattrKey(inode)
 	var n int64
 	err := m.txn(ctx, func(tx *redis.Tx) error {
-		cmd, err := tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.HDel(ctx, m.xattrKey(inode), name)
+		exists, err := tx.Exists(ctx, inodeKey).Result()
+		if err != nil {
+			return err
+		}
+		if exists == 0 {
+			return syscall.ENOENT
+		}
+		cmd, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.HDel(ctx, xattrKey, name)
 			m.genLog(ctx, pipe, time.Now(), "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
 			return nil
 		})
@@ -4350,7 +4380,7 @@ func (m *redisMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.E
 			}
 		}
 		return err
-	}, m.xattrKey(inode))
+	}, inodeKey, xattrKey)
 	if err != nil {
 		return errno(err)
 	} else if n == 0 {
@@ -5731,6 +5761,15 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 					if delta != 0 {
 						p.HIncrBy(ctx, m.sliceRefs(), field, delta)
 					}
+				}
+				if m.getFormat().ChangeLog && len(validInfos) > 0 {
+					args := make([]string, 0, 2*len(validInfos))
+					inodes := make([]string, 0, len(validInfos))
+					for _, info := range validInfos {
+						args = append(args, strconv.FormatUint(uint64(info.srcIno), 10), logEncode2(string(info.entry.Name)))
+						inodes = append(inodes, strconv.FormatUint(uint64(info.dstIno), 10))
+					}
+					m.genLog(ctx, p, now, "CLONEBATCH(%d,%d,%d,%d,%s,%s):%s", dstParent, cmode, cumask, ctx.Uid(), logGids(ctx), strings.Join(args, ","), strings.Join(inodes, ","))
 				}
 				return nil
 			})

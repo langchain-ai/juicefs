@@ -1577,7 +1577,9 @@ func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 	var inode Ino
 	var opened bool
 	var newSpace, newInode int64
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *kvTxn) error {
+		trash = requestedTrash
 		opened = false
 		*attr = Attr{}
 		newSpace, newInode = 0, 0
@@ -1792,6 +1794,7 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 				keys = append(keys, m.entryKey(parent, string(entry.Name)))
 			}
 			vals := tx.gets(keys...)
+			seenNames := make(map[string]struct{}, len(batch))
 			for idx, entry := range batch {
 				if vals[idx] == nil {
 					continue
@@ -1800,8 +1803,13 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 				if ino != entry.Inode || typ == TypeDirectory || (entry.Attr != nil && typ != entry.Attr.Typ) {
 					continue
 				}
+				name := string(entry.Name)
+				if _, ok := seenNames[name]; ok {
+					continue
+				}
+				seenNames[name] = struct{}{}
 				info := entryInfo{
-					name:  string(entry.Name),
+					name:  name,
 					inode: ino,
 					typ:   typ,
 					trash: trash,
@@ -2035,7 +2043,9 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldA
 			return st
 		}
 	}
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *kvTxn) error {
+		trash = requestedTrash
 		buf := tx.get(m.entryKey(parent, name))
 		if buf == nil && m.conf.CaseInsensi {
 			if e := m.resolveCase(ctx, parent, name); e != nil {
@@ -2152,7 +2162,9 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 	if !parentSrc.IsTrash() { // there should be no conflict if parentSrc is in trash, relax lock to accelerate `restore` subcommand
 		parentLocks = append(parentLocks, parentSrc)
 	}
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *kvTxn) error {
+		trash = requestedTrash
 		opened = false
 		dino, dtyp = 0, 0
 		tattr = Attr{}
@@ -2256,6 +2268,8 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 				}
 			} else if dino == ino {
 				return nil
+			} else if ctx.Uid() != 0 && sattr.Mode&01000 != 0 && ctx.Uid() != sattr.Uid && ctx.Uid() != iattr.Uid {
+				return syscall.EACCES
 			} else if typ == TypeDirectory && dtyp != TypeDirectory {
 				return syscall.ENOTDIR
 			} else if typ != TypeDirectory && dtyp == TypeDirectory {
@@ -3434,6 +3448,9 @@ func (m *kvMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 	}
 	key := m.xattrKey(inode, name)
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
+		if tx.get(m.inodeKey(inode)) == nil {
+			return syscall.ENOENT
+		}
 		v := tx.get(key)
 		switch flags {
 		case XattrCreate:
@@ -3450,12 +3467,15 @@ func (m *kvMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 		}
 		m.genLog(tx, time.Now(), "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
 		return nil
-	}))
+	}, inode))
 }
 
 func (m *kvMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
 	key := m.xattrKey(inode, name)
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
+		if tx.get(m.inodeKey(inode)) == nil {
+			return syscall.ENOENT
+		}
 		value := tx.get(key)
 		if value == nil {
 			return ENOATTR
@@ -3463,7 +3483,7 @@ func (m *kvMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 		tx.delete(key)
 		m.genLog(tx, time.Now(), "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
 		return nil
-	}))
+	}, inode))
 }
 
 func (m *kvMeta) getQuotaKey(qtype uint32, key uint64) ([]byte, error) {
@@ -3551,17 +3571,13 @@ func (m *kvMeta) doDelQuota(ctx Context, qtype uint32, key uint64) error {
 	}
 
 	if qtype == UserQuotaType || qtype == GroupQuotaType {
-		quota := &Quota{}
-		val, err := m.get(quotaKey)
-		if err != nil {
-			return err
-		}
-		if len(val) > 0 {
-			quota = m.parseQuota(val)
-		}
-		quota.MaxSpace = -1
-		quota.MaxInodes = -1
 		return m.txn(ctx, func(tx *kvTxn) error {
+			quota := &Quota{}
+			if val := tx.get(quotaKey); len(val) > 0 {
+				quota = m.parseQuota(val)
+			}
+			quota.MaxSpace = -1
+			quota.MaxInodes = -1
 			tx.set(quotaKey, m.packQuota(quota))
 			m.genLog(tx, time.Now(), "DELQUOTA(%d,%d)", qtype, key)
 			return nil
@@ -3618,20 +3634,18 @@ func (m *kvMeta) cleanUgUsage(ctx Context, qtype uint32) error {
 		prefix = "QG"
 	}
 
-	pairs, err := m.scanValues(ctx, m.fmtKey(prefix), -1, nil)
-	if err != nil {
-		return fmt.Errorf("failed to scan %s quotas: %w", prefix, err)
-	}
+	begin := m.fmtKey(prefix)
 	return m.txn(ctx, func(tx *kvTxn) error {
-		for k, v := range pairs {
-			if len(v) != 32 {
-				continue
+		tx.scan(begin, nextKey(begin), false, func(key, value []byte) bool {
+			if len(value) != 32 {
+				return true
 			}
-			quota := m.parseQuota(v)
+			quota := m.parseQuota(value)
 			quota.UsedSpace = 0
 			quota.UsedInodes = 0
-			tx.set([]byte(k), m.packQuota(quota))
-		}
+			tx.set(key, m.packQuota(quota))
+			return true
+		})
 		return nil
 	})
 }
@@ -4747,6 +4761,15 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 				return syscall.ENOENT
 			}
 			tx.set(m.symKey(sc.dstIno), target)
+		}
+		if m.getFormat().ChangeLog {
+			args := make([]string, 0, 2*len(cloneInfos))
+			inodes := make([]string, 0, len(cloneInfos))
+			for _, info := range cloneInfos {
+				args = append(args, strconv.FormatUint(uint64(info.srcIno), 10), logEncode2(info.name))
+				inodes = append(inodes, strconv.FormatUint(uint64(info.dstIno), 10))
+			}
+			m.genLog(tx, now, "CLONEBATCH(%d,%d,%d,%d,%s,%s):%s", dstParent, cmode, cumask, ctx.Uid(), logGids(ctx), strings.Join(args, ","), strings.Join(inodes, ","))
 		}
 
 		return nil
