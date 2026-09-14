@@ -47,11 +47,13 @@ import (
 )
 
 const (
-	inodeBatch     = 1 << 10
-	sliceIdBatch   = 4 << 10
-	nlocks         = 1024
-	maxSymCacheNum = int32(10000)
-	unknownUsage   = -1
+	inodeBatch                   = 1 << 10
+	sliceIdBatch                 = 4 << 10
+	nlocks                       = 1024
+	maxSymCacheNum               = int32(10000)
+	unknownUsage                 = -1
+	writeCompactionInterval      = 200
+	writeCompactionDebtThreshold = 350
 )
 
 var (
@@ -64,6 +66,10 @@ var (
 	maxSlices         = 2500
 	inodeNeedPrefetch = uint64(utils.JitterIt(inodeBatch * 0.1)) // Add jitter to reduce probability of txn conflicts
 )
+
+func shouldStartWriteCompaction(numSlices int) bool {
+	return numSlices%writeCompactionInterval == writeCompactionInterval-1 || numSlices > writeCompactionDebtThreshold
+}
 
 func checkInodeName(name string) syscall.Errno {
 	if len(name) == 0 || strings.ContainsAny(name, "/\x00") {
@@ -2173,7 +2179,7 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 	if st == 0 {
 		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
-		if numSlices%100 == 99 || numSlices > 350 {
+		if shouldStartWriteCompaction(numSlices) {
 			if numSlices < maxSlices {
 				go m.compactChunk(inode, indx, false, false, int(attr.Tier))
 			} else {
