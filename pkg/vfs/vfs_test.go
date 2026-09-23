@@ -42,6 +42,11 @@ import (
 // nolint:errcheck
 
 func createTestVFS(applyMetaConfOption func(metaConfig *meta.Config), metaUri string) (*VFS, object.ObjectStorage) {
+	return createTestVFSWithStore(applyMetaConfOption, metaUri, nil)
+}
+
+// createTestVFSWithStore is createTestVFS with the object store passed through wrapStore, when set.
+func createTestVFSWithStore(applyMetaConfOption func(metaConfig *meta.Config), metaUri string, wrapStore func(object.ObjectStorage) object.ObjectStorage) (*VFS, object.ObjectStorage) {
 	mp := "/jfs"
 	metaConf := meta.DefaultConf()
 	metaConf.MountPoint = mp
@@ -80,6 +85,9 @@ func createTestVFS(applyMetaConfOption func(metaConfig *meta.Config), metaUri st
 		FuseOpts: &FuseOptions{},
 	}
 	blob, _ := object.CreateStorage("mem", "", "", "", "")
+	if wrapStore != nil {
+		blob = wrapStore(blob)
+	}
 	registry := prometheus.NewRegistry() // replace default so only JuiceFS metrics are exposed
 	registerer := prometheus.WrapRegistererWithPrefix("juicefs_",
 		prometheus.WrapRegistererWith(prometheus.Labels{"mp": mp, "vol_name": format.Name}, registry))
