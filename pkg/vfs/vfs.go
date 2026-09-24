@@ -786,7 +786,7 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	}
 	defer h.Runlock()
 
-	_ = v.writer.Flush(ctx, ino)
+	_ = v.writer.FlushRange(ctx, ino, off, uint64(len(buf)))
 	n, err = h.reader.Read(ctx, off, buf)
 	for err == syscall.EAGAIN {
 		n, err = h.reader.Read(ctx, off, buf)
