@@ -48,3 +48,10 @@ test*.bak
 dist/
 juicefs.egg-info/
 pkg/meta/jfs-load-dump/
+.env
+.env.*
+*.pem
+*.key
+*.crt
+credentials.json
+.venv/

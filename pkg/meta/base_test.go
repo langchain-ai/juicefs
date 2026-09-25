@@ -1753,22 +1753,96 @@ func TestShouldStartWriteCompaction(t *testing.T) {
 	tests := []struct {
 		name      string
 		numSlices int
-		want      bool
+		want100   bool
+		want200   bool
+		want250   bool
+		want350   bool
 	}{
-		{name: "old interval boundary", numSlices: 99, want: false},
-		{name: "before treatment interval", numSlices: 198, want: false},
-		{name: "treatment interval boundary", numSlices: 199, want: true},
-		{name: "after treatment interval", numSlices: 200, want: false},
-		{name: "at debt threshold", numSlices: 350, want: false},
-		{name: "above debt threshold", numSlices: 351, want: true},
+		{name: "empty chunk", numSlices: 0},
+		{name: "before old interval", numSlices: 98},
+		{name: "old interval boundary", numSlices: 99, want100: true},
+		{name: "after old interval", numSlices: 100},
+		{name: "before default interval", numSlices: 198},
+		{name: "default interval boundary", numSlices: 199, want100: true, want200: true},
+		{name: "after default interval", numSlices: 200},
+		{name: "custom interval boundary", numSlices: 249, want250: true},
+		{name: "after custom interval", numSlices: 250},
+		{name: "third old interval boundary", numSlices: 299, want100: true},
+		{name: "maximum interval boundary", numSlices: 349, want350: true},
+		{name: "at debt threshold", numSlices: 350},
+		{name: "above debt threshold", numSlices: 351, want100: true, want200: true, want250: true, want350: true},
+		{name: "before synchronous threshold", numSlices: 2499, want100: true, want200: true, want250: true, want350: true},
+		{name: "at synchronous threshold", numSlices: 2500, want100: true, want200: true, want250: true, want350: true},
+	}
+
+	for _, interval := range []int{100, 200, 250, 350} {
+		t.Run(strconv.Itoa(interval), func(t *testing.T) {
+			t.Setenv("JFS_WRITE_COMPACTION_INTERVAL", strconv.Itoa(interval))
+			m := newBaseMeta("", testConfig())
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					want := tt.want200
+					if interval == 100 {
+						want = tt.want100
+					} else if interval == 250 {
+						want = tt.want250
+					} else if interval == 350 {
+						want = tt.want350
+					}
+					if got := m.shouldStartWriteCompaction(tt.numSlices); got != want {
+						t.Fatalf("shouldStartWriteCompaction(%d) = %t, want %t", tt.numSlices, got, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestWriteCompactionIntervalFromEnv(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		unset bool
+		want  int
+	}{
+		{name: "unset", unset: true, want: 200},
+		{name: "empty", want: 200},
+		{name: "legacy", value: "100", want: 100},
+		{name: "default", value: "200", want: 200},
+		{name: "custom", value: "250", want: 250},
+		{name: "maximum", value: "350", want: 350},
+		{name: "zero", value: "0", want: 200},
+		{name: "negative", value: "-1", want: 200},
+		{name: "below minimum", value: "99", want: 200},
+		{name: "above maximum", value: "351", want: 200},
+		{name: "malformed", value: "invalid", want: 200},
+		{name: "fraction", value: "200.5", want: 200},
+		{name: "overflow", value: "999999999999999999999999", want: 200},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldStartWriteCompaction(tt.numSlices); got != tt.want {
-				t.Fatalf("shouldStartWriteCompaction(%d) = %t, want %t", tt.numSlices, got, tt.want)
+			t.Setenv("JFS_WRITE_COMPACTION_INTERVAL", tt.value)
+			if tt.unset {
+				require.NoError(t, os.Unsetenv("JFS_WRITE_COMPACTION_INTERVAL"))
+			}
+			m := newBaseMeta("", testConfig())
+			if got := m.writeCompactionInterval; got != tt.want {
+				t.Fatalf("write compaction interval = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestWriteCompactionIntervalCachedPerClient(t *testing.T) {
+	t.Setenv("JFS_WRITE_COMPACTION_INTERVAL", "100")
+	m := newBaseMeta("", testConfig())
+	t.Setenv("JFS_WRITE_COMPACTION_INTERVAL", "200")
+	if !m.shouldStartWriteCompaction(99) {
+		t.Fatal("existing client should retain the 100-slice interval")
+	}
+	if newBaseMeta("", testConfig()).shouldStartWriteCompaction(99) {
+		t.Fatal("new client should use the 200-slice interval")
 	}
 }
 
