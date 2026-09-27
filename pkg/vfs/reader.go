@@ -605,6 +605,10 @@ func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, 
 			if f.shouldStop() {
 				return 0, f.err
 			}
+			if s.state == INVALID {
+				// Stopped by a failure that a later Read has already cleared.
+				return 0, syscall.EIO
+			}
 		}
 	}
 
@@ -637,6 +641,12 @@ func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, sys
 	f.acquire()
 	defer f.release()
 
+	// A failed read fails only the reads in flight; the next one retries, since one backend blip would otherwise
+	// fail every later read on this handle. A missing file stays failed.
+	if f.err != 0 && f.err != syscall.ENOENT {
+		f.err = 0
+		f.tried = 0
+	}
 	if f.shouldStop() {
 		return 0, f.err
 	}
