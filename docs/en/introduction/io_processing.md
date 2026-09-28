@@ -42,6 +42,8 @@ Note that a block is an immutable object, because most object storage services d
 
 Compared to sequential writes, random writes in large files are more complicated. There could be a number of intermittent slices in a chunk, possibly all smaller than 4 MiB. Frequent random writes require frequent metadata updates, which in turn further impact performance. To improve read performance, JuiceFS schedules compaction tasks when the number of slices under a chunk exceeds the limit. You can also manually trigger compaction by running [`juicefs gc`](../administration/status_check_and_maintenance.md#gc).
 
+The write-triggered compaction interval defaults to 200 slices. Set `JFS_WRITE_COMPACTION_INTERVAL` in the JuiceFS client process environment to an integer from 100 through 350 to change it; `100` restores the previous cadence. The client reads this setting once when its metadata client is created, so changing a running mount requires restarting it with the new environment. Unset or empty values use 200; invalid or out-of-range values produce a warning and fall back to 200. The interval is based on each chunk's current slice count: compaction is considered when the count modulo the interval equals the interval minus one. The independent trigger above 350 slices, synchronous compaction at 2500 slices, and read-triggered and manual compaction are unaffected.
+
 ### Client write cache {#client-write-cache}
 
 Client write cache is also referred to as "Writeback mode" throughout the docs.
