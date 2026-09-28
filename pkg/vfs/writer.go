@@ -43,6 +43,8 @@ type FileWriter interface {
 type DataWriter interface {
 	Open(inode Ino, fleng uint64, tierID uint8) FileWriter
 	Flush(ctx meta.Context, inode Ino) syscall.Errno
+	// FlushRange commits the pending writes a read of [off, off+size) must see; see fileWriter.flushRange.
+	FlushRange(ctx meta.Context, inode Ino, off, size uint64) syscall.Errno
 	GetLength(inode Ino) uint64
 	Truncate(inode Ino, length uint64)
 	UpdateMtime(inode Ino, mtime time.Time)
@@ -226,6 +228,9 @@ func (c *chunkWriter) commitThread() {
 		if s.growing {
 			f.commitcond.Broadcast()
 		}
+		if f.readwaiting > 0 {
+			f.readcond.Broadcast()
+		}
 		c.slices = c.slices[1:]
 	}
 	f.freeChunk(c)
@@ -242,12 +247,14 @@ type fileWriter struct {
 	err          syscall.Errno
 	flushwaiting uint16
 	writewaiting uint16
+	readwaiting  uint16
 	refs         uint16
 	chunks       map[uint32]*chunkWriter
 
 	flushcond  *utils.Cond // wait for chunks==nil (flush)
 	writecond  *utils.Cond // wait for flushwaiting==0 (write)
 	commitcond *utils.Cond // wait for committed==true of dependency slice (commit)
+	readcond   *utils.Cond // wait for committed==true of a slice a read overlaps (flushRange)
 }
 
 // protected by file
@@ -383,6 +390,15 @@ func (f *fileWriter) updateMtime(t time.Time) {
 	}
 }
 
+// flushTimeout bounds how long a flush waits for its slices to commit.
+func (f *fileWriter) flushTimeout() time.Duration {
+	wait := time.Second * time.Duration((f.w.maxRetries+2)*(f.w.maxRetries+2)/2)
+	if wait < time.Minute*5 {
+		wait = time.Minute * 5
+	}
+	return wait
+}
+
 func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	s := time.Now()
 	f.Lock()
@@ -390,10 +406,7 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	f.flushwaiting++
 
 	var err syscall.Errno
-	var wait = time.Second * time.Duration((f.w.maxRetries+2)*(f.w.maxRetries+2)/2)
-	if wait < time.Minute*5 {
-		wait = time.Minute * 5
-	}
+	var wait = f.flushTimeout()
 	var deadline = time.Now().Add(wait)
 	for len(f.chunks) > 0 && err == 0 {
 		for _, c := range f.chunks {
@@ -435,6 +448,88 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 
 func (f *fileWriter) Flush(ctx meta.Context) syscall.Errno {
 	return f.flush(ctx, false)
+}
+
+// freezeThrough starts the upload of the chunk's slices up to and including slices[i].
+// protected by file
+func (c *chunkWriter) freezeThrough(i int) {
+	for _, s := range c.slices[:i+1] {
+		if !s.freezed {
+			s.freezed = true
+			go s.flushData()
+		}
+	}
+}
+
+// flushRange waits until every write that overlaps [off, off+size) and was pending when it was called is committed,
+// which is what a read of that range needs: the reader serves committed slices only. A chunk commits its slices in
+// the order they were created, so the slices ahead of the last overlapping one are frozen with it. Unlike flush, it
+// does not hold back writes to the file: a write issued while a read waits may or may not be visible to that read.
+// Pending writes outside the range are left to the background flusher.
+func (f *fileWriter) flushRange(ctx meta.Context, off, size uint64) syscall.Errno {
+	if size == 0 {
+		return 0
+	}
+	start := time.Now()
+	end := off + size
+	f.Lock()
+	defer f.Unlock()
+
+	var targets []*sliceWriter
+	for indx := off / meta.ChunkSize; indx <= (end-1)/meta.ChunkSize; indx++ {
+		c := f.chunks[uint32(indx)]
+		if c == nil {
+			continue
+		}
+		base := indx * meta.ChunkSize
+		last := -1
+		for i, s := range c.slices {
+			if soff := base + uint64(s.off); soff < end && off < soff+uint64(s.slen) {
+				last = i
+			}
+		}
+		if last < 0 {
+			continue
+		}
+		c.freezeThrough(last)
+		targets = append(targets, c.slices[last])
+		// The first slice of a chunk appended past the end of the file may depend on the growing slice of an earlier
+		// chunk (writeChunk) and cannot commit before it, so that slice, and what is ahead of it, is frozen too.
+		for d := c.slices[0].dep; d != nil && !d.committed; {
+			dc := d.chunk
+			for i, s := range dc.slices {
+				if s == d {
+					dc.freezeThrough(i)
+					break
+				}
+			}
+			d = dc.slices[0].dep
+		}
+	}
+	if len(targets) == 0 {
+		return 0
+	}
+
+	var err syscall.Errno
+	wait := f.flushTimeout()
+	deadline := start.Add(wait)
+	f.readwaiting++
+	for _, s := range targets {
+		for !s.committed && err == 0 {
+			if f.readcond.WaitWithTimeout(time.Second*3) && ctx.Canceled() && time.Since(start) > f.w.conf.Chunk.PutTimeout*2 {
+				logger.Warnf("flush range %d (%d,%d) interrupted after %s", f.inode, off, size, time.Since(start))
+				err = syscall.EINTR
+			} else if time.Now().After(deadline) {
+				logger.Errorf("flush range %d (%d,%d) timeout after waited %s", f.inode, off, size, wait)
+				err = syscall.EIO
+			}
+		}
+	}
+	f.readwaiting--
+	if err == 0 {
+		err = f.err
+	}
+	return err
 }
 
 func (f *fileWriter) Close(ctx meta.Context) syscall.Errno {
@@ -527,6 +622,7 @@ func (w *dataWriter) Open(inode Ino, len uint64, tierID uint8) FileWriter {
 		f.flushcond = utils.NewCond(f)
 		f.writecond = utils.NewCond(f)
 		f.commitcond = utils.NewCond(f)
+		f.readcond = utils.NewCond(f)
 		w.files[inode] = f
 	}
 	f.refs++
@@ -552,6 +648,14 @@ func (w *dataWriter) Flush(ctx meta.Context, inode Ino) syscall.Errno {
 	f := w.find(inode)
 	if f != nil {
 		return f.Flush(ctx)
+	}
+	return 0
+}
+
+func (w *dataWriter) FlushRange(ctx meta.Context, inode Ino, off, size uint64) syscall.Errno {
+	f := w.find(inode)
+	if f != nil {
+		return f.flushRange(ctx, off, size)
 	}
 	return 0
 }
