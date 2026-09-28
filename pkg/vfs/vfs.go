@@ -23,6 +23,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -786,7 +787,11 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	}
 	defer h.Runlock()
 
-	_ = v.writer.Flush(ctx, ino)
+	if v.readFlushRange {
+		_ = v.writer.FlushRange(ctx, ino, off, uint64(len(buf)))
+	} else {
+		_ = v.writer.Flush(ctx, ino)
+	}
 	n, err = h.reader.Read(ctx, off, buf)
 	for err == syscall.EAGAIN {
 		n, err = h.reader.Read(ctx, off, buf)
@@ -1230,6 +1235,7 @@ type VFS struct {
 	reader          DataReader
 	writer          DataWriter
 	cacheFiller     *CacheFiller
+	readFlushRange  bool
 
 	handles   map[Ino][]*handle
 	handleIno map[uint64]Ino
@@ -1246,18 +1252,28 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 	reader := NewDataReader(conf, m, store)
 	writer := NewDataWriter(conf, m, store, reader)
 
+	var readFlushRange bool
+	if value := os.Getenv("JFS_READ_FLUSH_RANGE"); value != "" {
+		var err error
+		readFlushRange, err = strconv.ParseBool(value)
+		if err != nil {
+			logger.Warnf("JFS_READ_FLUSH_RANGE must be a boolean; using false")
+		}
+	}
+
 	v := &VFS{
-		Conf:        conf,
-		Meta:        m,
-		Store:       store,
-		reader:      reader,
-		writer:      writer,
-		cacheFiller: NewCacheFiller(conf, m, store),
-		handles:     make(map[Ino][]*handle),
-		handleIno:   make(map[uint64]Ino),
-		modifiedAt:  make(map[meta.Ino]time.Time),
-		nextfh:      1,
-		registry:    registry,
+		readFlushRange: readFlushRange,
+		Conf:           conf,
+		Meta:           m,
+		Store:          store,
+		reader:         reader,
+		writer:         writer,
+		cacheFiller:    NewCacheFiller(conf, m, store),
+		handles:        make(map[Ino][]*handle),
+		handleIno:      make(map[uint64]Ino),
+		modifiedAt:     make(map[meta.Ino]time.Time),
+		nextfh:         1,
+		registry:       registry,
 	}
 
 	n := getInternalNode(ConfigInode)

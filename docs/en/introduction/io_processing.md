@@ -52,6 +52,10 @@ Learn more in [Client Write Cache](../guide/cache.md#client-write-cache).
 
 ## Data reading process {#workflow-of-read}
 
+VFS reads flush the file's pending writes before reading by default. Set `JFS_READ_FLUSH_RANGE=true` in the client process environment to opt into flushing only pending writes that overlap the read, together with the earlier slices they depend on. Unrelated pending writes can remain buffered, reducing interference between reads and writes to different ranges of a large file. `fsync`, `flush`, and `release` retain their full-flush behavior; this setting does not change persistent formats or the separate `pkg/fs` read path.
+
+The setting is read once when the VFS client is created; changing a running mount requires restarting it with the new environment. Unset, empty, or false values preserve full-file flushing. Boolean values follow Go's `strconv.ParseBool`: `1`, `t`, `T`, `true`, `TRUE`, and `True` enable it; `0`, `f`, `F`, `false`, `FALSE`, and `False` disable it. Invalid values produce a warning and leave the optimization disabled.
+
 JuiceFS supports sequential reads and random reads (including mmap-based random reads). During read requests, the object corresponding to the block is completely read through the `GetObject` API of the object storage, or only a certain range of data in the object may be read (e.g., the read range is limited by the `Range` parameter of [S3 API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html)). Meanwhile, prefetching is performed (controlled by the [`--prefetch`](../reference/command_reference.mdx#mount) option) to download the complete data block into the local cache directory, as shown in the `blockcache` write speed in the second stage of the above metrics figure. This is very good for sequential reads as all cached data is utilized, maximizing the object storage access efficiency. The dataflow is illustrated in the figure below:
 
 ![internals-read](../images/internals-read.png)
