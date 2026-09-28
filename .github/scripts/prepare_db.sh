@@ -61,8 +61,12 @@ install_keydb() {
 }
 
 install_minio() {
-    docker run -d -p 9000:9000 -p 9001:9001 -e "MINIO_ROOT_USER=testUser" -e "MINIO_ROOT_PASSWORD=testUserPassword" quay.io/minio/minio:RELEASE.2022-01-25T19-56-04Z server /data --console-address ":9001"
-    go install github.com/minio/mc@RELEASE.2022-01-07T06-01-38Z && mc alias set local http://127.0.0.1:9000 testUser testUserPassword && mc mb local/testbucket
+    # MinIO no longer publishes images or binaries, so build the pinned release from the module proxy.
+    # Its old golang.org/x/net fails Go 1.23+'s linkname check.
+    go install -ldflags=-checklinkname=0 github.com/minio/minio@RELEASE.2022-01-25T19-56-04Z
+    MINIO_ROOT_USER=testUser MINIO_ROOT_PASSWORD=testUserPassword nohup "$(go env GOPATH)/bin/minio" server /tmp/minio-data --console-address ":9001" > /tmp/minio.log 2>&1 &
+    check_port 9000
+    go install -ldflags=-checklinkname=0 github.com/minio/mc@RELEASE.2022-01-07T06-01-38Z && mc alias set local http://127.0.0.1:9000 testUser testUserPassword && mc mb local/testbucket
 }
 
 install_fdb() {
