@@ -47,11 +47,14 @@ import (
 )
 
 const (
-	inodeBatch     = 1 << 10
-	sliceIdBatch   = 4 << 10
-	nlocks         = 1024
-	maxSymCacheNum = int32(10000)
-	unknownUsage   = -1
+	inodeBatch                     = 1 << 10
+	sliceIdBatch                   = 4 << 10
+	nlocks                         = 1024
+	maxSymCacheNum                 = int32(10000)
+	unknownUsage                   = -1
+	defaultWriteCompactionInterval = 200
+	minWriteCompactionInterval     = 100
+	writeCompactionDebtThreshold   = 350
 )
 
 var (
@@ -64,6 +67,10 @@ var (
 	maxSlices         = 2500
 	inodeNeedPrefetch = uint64(utils.JitterIt(inodeBatch * 0.1)) // Add jitter to reduce probability of txn conflicts
 )
+
+func (m *baseMeta) shouldStartWriteCompaction(numSlices int) bool {
+	return numSlices%m.writeCompactionInterval == m.writeCompactionInterval-1 || numSlices > writeCompactionDebtThreshold
+}
 
 func checkInodeName(name string) syscall.Errno {
 	if len(name) == 0 || strings.ContainsAny(name, "/\x00") {
@@ -275,6 +282,8 @@ type baseMeta struct {
 	conf *Config
 	fmt  *Format
 
+	writeCompactionInterval int
+
 	root         Ino
 	txlocks      [nlocks]sync.Mutex // Pessimistic locks to reduce conflict
 	subTrash     internalNode
@@ -359,7 +368,17 @@ type baseMeta struct {
 }
 
 func newBaseMeta(addr string, conf *Config) *baseMeta {
+	interval := defaultWriteCompactionInterval
+	if value := os.Getenv("JFS_WRITE_COMPACTION_INTERVAL"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed >= minWriteCompactionInterval && parsed <= writeCompactionDebtThreshold {
+			interval = parsed
+		} else {
+			logger.Warnf("JFS_WRITE_COMPACTION_INTERVAL must be an integer between %d and %d; using %d", minWriteCompactionInterval, writeCompactionDebtThreshold, defaultWriteCompactionInterval)
+		}
+	}
 	return &baseMeta{
+		writeCompactionInterval: interval,
+
 		addr:         utils.RemovePassword(addr),
 		conf:         conf,
 		sid:          conf.Sid,
@@ -2173,7 +2192,7 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 	if st == 0 {
 		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
-		if numSlices%100 == 99 || numSlices > 350 {
+		if m.shouldStartWriteCompaction(numSlices) {
 			if numSlices < maxSlices {
 				go m.compactChunk(inode, indx, false, false, int(attr.Tier))
 			} else {
