@@ -240,11 +240,10 @@ func (s *sliceReader) invalidate() {
 		s.state = REFRESH
 		// TODO cancel ongoing read
 	case READY:
-		if s.refs > 0 {
-			s.state = NEW
-			go s.run()
-		} else {
-			s.state = INVALID
+		// Reads holding a READY page copy it without waiting, so it is never refilled: they keep the bytes they
+		// found, new reads skip it and fetch the new bytes into another slice, and the last holder deletes it.
+		s.state = INVALID
+		if s.refs == 0 {
 			s.delete() // nobody wants it anymore, so delete it
 		}
 	}
