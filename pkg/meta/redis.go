@@ -125,6 +125,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	keyFile := query.pop("tls-key-file")
 	caCertFile := query.pop("tls-ca-cert-file")
 	tlsServerName := query.pop("tls-server-name")
+	authProvider := query.pop("auth-provider")
 
 	// Client-side caching options
 	clientCacheStr := query.pop("client-cache")
@@ -176,6 +177,11 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 			}
 		}
 	}
+	creds, err := redisStreamingCredentials(authProvider, opt, newAzureRedisCredentials)
+	if err != nil {
+		return nil, err
+	}
+	opt.StreamingCredentialsProvider = creds
 	opt.MaxRetries = conf.Retries
 	if opt.MaxRetries == 0 {
 		opt.MaxRetries = -1 // Redis use -1 to disable retries
@@ -209,6 +215,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 		fopt.DB = opt.DB
 		fopt.Username = opt.Username
 		fopt.Password = opt.Password
+		fopt.StreamingCredentialsProvider = opt.StreamingCredentialsProvider
 		fopt.TLSConfig = opt.TLSConfig
 		fopt.MaxRetries = opt.MaxRetries
 		fopt.MinRetryBackoff = opt.MinRetryBackoff
@@ -246,6 +253,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 			copt.MaxRedirects = 1
 			copt.Username = opt.Username
 			copt.Password = opt.Password
+			copt.StreamingCredentialsProvider = opt.StreamingCredentialsProvider
 			copt.TLSConfig = opt.TLSConfig
 			copt.MaxRetries = opt.MaxRetries
 			copt.MinRetryBackoff = opt.MinRetryBackoff
