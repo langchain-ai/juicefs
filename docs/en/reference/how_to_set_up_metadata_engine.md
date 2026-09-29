@@ -166,6 +166,19 @@ When specifying options in a URL, start with the `?` symbol and use the `&` symb
 
 In the above example, `/etc/certs` is just a directory name. Replace it with your actual certificate directory when using it, which can be a relative or absolute path.
 
+#### Microsoft Entra ID authentication
+
+For Azure Managed Redis or Azure Cache for Redis with access keys disabled, add `auth-provider=azure` to a `rediss://` URL and omit the username and password:
+
+```shell
+juicefs format --storage wasb \
+    ... \
+    "rediss://<name>.<region>.redis.azure.net:10000/1?auth-provider=azure"
+    pics
+```
+
+JuiceFS gets an Entra ID token for `https://redis.azure.com/.default` from the Azure default credential chain (workload identity, managed identity, or `AZURE_*` environment variables) and reauthenticates open connections before each token expires. The Redis username is the `oid` claim of the token. The identity needs a data access policy on the Redis instance. `auth-provider=azure` fails when the URL is not `rediss://` or when a password is set in the URL or in `REDIS_PASSWORD`, `META_PASSWORD`, or `META_PASSWORD_FILE`.
+
 ### Valkey
 
 [Valkey](https://valkey.io) is an open-source fork of Redis, created to preserve the project's community-driven governance while remaining highly compatible with the Redis ecosystem. Valkey focuses on maintaining stability, improving performance, and continuing innovation under a neutral approach, ensuring long-term availability for users who rely on Redis-compatible workloads.
