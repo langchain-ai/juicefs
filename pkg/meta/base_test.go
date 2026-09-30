@@ -7615,9 +7615,10 @@ func testWriteMultiMaxSlices(t *testing.T, m Meta, rec *compactionRecorder) {
 // another client would: armed times, it runs spoil just before a transaction that appends to its chunk
 // commits.
 type wmSpoiler struct {
-	armed   atomic.Int32
-	spoiled atomic.Int32
-	spoil   func() error
+	armed    atomic.Int32
+	spoiled  atomic.Int32
+	attempts atomic.Int32 // commits of the watched transaction tried, spoiled or not
+	spoil    func() error
 }
 
 func (s *wmSpoiler) before() error {
@@ -7645,6 +7646,7 @@ func (h wmSpoilHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.P
 	return func(ctx context.Context, cmds []redis.Cmder) error {
 		for _, c := range cmds {
 			if args := c.Args(); c.Name() == "rpush" && len(args) > 1 && args[1] == h.key {
+				h.attempts.Add(1)
 				if err := h.before(); err != nil {
 					return err
 				}
@@ -7669,6 +7671,7 @@ func (c *wmSpoilingKV) txn(ctx context.Context, f func(*kvTxn) error, retry int)
 			return err
 		}
 		if tr.hit {
+			c.attempts.Add(1)
 			return c.before()
 		}
 		return nil
@@ -7701,11 +7704,27 @@ func testWriteMultiConflict(t *testing.T, m Meta) {
 		}
 		return nil
 	}}
+	// FoundationDB's client retries a conflicting commit inside Transact: the meta layer neither counts
+	// that restart nor can limit it
+	engineRetries := false
 	twin := wmOpenTwin(t, m, func(tw Meta) {
 		switch tw := tw.(type) {
 		case *redisMeta:
-			tw.rdb.AddHook(wmSpoilHook{sp, tw.chunkKey(inode, 0)})
+			hook := wmSpoilHook{sp, tw.chunkKey(inode, 0)}
+			if cc, ok := tw.rdb.(*redis.ClusterClient); ok {
+				// Watch runs on the client of the node that owns the key's slot, with that node's hooks
+				if err := cc.ForEachShard(context.Background(), func(_ context.Context, n *redis.Client) error {
+					n.AddHook(hook)
+					return nil
+				}); err != nil {
+					t.Fatalf("hook the cluster's nodes: %s", err)
+				}
+				cc.OnNewNode(func(n *redis.Client) { n.AddHook(hook) })
+			} else {
+				tw.rdb.AddHook(hook)
+			}
 		case *kvMeta:
+			engineRetries = tw.client.name() == "fdb"
 			tw.client = &wmSpoilingKV{tkvClient: tw.client, wmSpoiler: sp, key: tw.chunkKey(inode, 0)}
 		default:
 			t.Fatalf("no way to make a conflict on %T", tw)
@@ -7729,7 +7748,10 @@ func testWriteMultiConflict(t *testing.T, m Meta) {
 	if n := sp.spoiled.Load(); n != 1 {
 		t.Fatalf("%d commits were spoiled, want 1", n)
 	}
-	if restarts() == restarted {
+	if n := sp.attempts.Load(); n < 2 {
+		t.Fatalf("the commit was not tried again after the conflict (%d attempts)", n)
+	}
+	if !engineRetries && restarts() == restarted {
 		t.Fatalf("the transaction was not restarted after the conflict")
 	}
 	wmCheckChunk(t, m, inode, 0, a, c)
@@ -7739,6 +7761,10 @@ func testWriteMultiConflict(t *testing.T, m Meta) {
 		t.Fatalf("length %d, want %d", l, length)
 	}
 
+	if engineRetries {
+		t.Log("the engine retries a conflicting commit itself, whatever the retry limit: skip the no-retry case")
+		return
+	}
 	used := wmUsedSpace(t, twin)
 	sp.armed.Store(1)
 	noRetry := WrapContext(context.WithValue(context.Background(), txMaxRetryKey{}, 1))
