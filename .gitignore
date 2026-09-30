@@ -34,6 +34,8 @@ pkg/meta/testdata
 *.log
 test*.sh
 test*.db*
+# the SQLite database TestVFSReadDirSort creates with "sqlite3://"
+pkg/vfs/\?_journal=*
 test*.py
 test*.bak
 

@@ -617,7 +617,12 @@ func (v *VFS) Truncate(ctx Context, ino Ino, size int64, fh uint64, attr *Attr) 
 		}
 		defer func(h *handle) { h.Wunlock() }(h)
 	}
-	_ = v.writer.Flush(ctx, ino)
+	if e := v.writer.Flush(ctx, ino); e != 0 && v.epochCommit {
+		// An epoch failed (or the flush was interrupted): the truncate would land on top of what the metadata holds,
+		// which lacks writes made before it.
+		err = e
+		return
+	}
 	if fh == 0 {
 		err = v.Meta.Truncate(ctx, ino, 0, uint64(size), attr, false)
 	} else {
@@ -787,17 +792,29 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	}
 	defer h.Runlock()
 
+	// Chunk mode ignores the flush error, as before; in epoch mode the pending writes this read must see are not
+	// committed when it fails (interrupted, timed out, or dropped after an earlier epoch of the file failed), so the
+	// reader would return old bytes: fail the read instead.
+	var flushErr syscall.Errno
 	if v.readFlushRange {
-		_ = v.writer.FlushRange(ctx, ino, off, uint64(len(buf)))
+		flushErr = v.writer.FlushRange(ctx, ino, off, uint64(len(buf)))
 	} else {
-		_ = v.writer.Flush(ctx, ino)
+		flushErr = v.writer.Flush(ctx, ino)
 	}
-	n, err = h.reader.Read(ctx, off, buf)
-	for err == syscall.EAGAIN {
+	if flushErr != 0 && v.epochCommit {
+		if flushErr == syscall.EINTR {
+			err = flushErr
+		} else {
+			err = syscall.EIO
+		}
+	} else {
 		n, err = h.reader.Read(ctx, off, buf)
-	}
-	if err == syscall.ENOENT {
-		err = syscall.EBADF
+		for err == syscall.EAGAIN {
+			n, err = h.reader.Read(ctx, off, buf)
+		}
+		if err == syscall.ENOENT {
+			err = syscall.EBADF
+		}
 	}
 	h.removeOp(ctx)
 	return
@@ -1236,6 +1253,7 @@ type VFS struct {
 	writer          DataWriter
 	cacheFiller     *CacheFiller
 	readFlushRange  bool
+	epochCommit     bool // the writer commits in epochs: reads and truncates fail when the writes before them are lost
 
 	handles   map[Ino][]*handle
 	handleIno map[uint64]Ino
@@ -1274,6 +1292,9 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 		modifiedAt:     make(map[meta.Ino]time.Time),
 		nextfh:         1,
 		registry:       registry,
+	}
+	if dw, ok := writer.(*dataWriter); ok {
+		v.epochCommit = dw.epochs
 	}
 
 	n := getInternalNode(ConfigInode)
@@ -1366,6 +1387,7 @@ func initVFSMetrics(v *VFS, writer DataWriter, reader DataReader, registerer pro
 	})
 	_ = registerer.Register(handlersGause)
 	InitMemoryBufferMetrics(writer, reader, registerer)
+	InitWriterMetrics(writer, registerer)
 }
 
 func InitMemoryBufferMetrics(writer DataWriter, reader DataReader, registerer prometheus.Registerer) {
