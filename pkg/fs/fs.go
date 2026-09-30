@@ -177,6 +177,9 @@ type File struct {
 }
 
 func NewFileSystem(conf *vfs.Config, m meta.Meta, d chunk.ChunkStore, registry *prometheus.Registry) (*FileSystem, error) {
+	if err := vfs.CheckCommitConfig(); err != nil {
+		return nil, err // rather than NewDataWriter's exit, which would end the process of the Java SDK
+	}
 	reader := vfs.NewDataReader(conf, m, d)
 	fs := &FileSystem{
 		m:               m,
@@ -240,6 +243,7 @@ func (fs *FileSystem) InitMetrics(reg prometheus.Registerer) {
 		reg.MustRegister(fs.writtenSizeHistogram)
 		reg.MustRegister(fs.opsDurationsHistogram)
 		vfs.InitMemoryBufferMetrics(fs.writer, fs.reader, reg)
+		vfs.InitWriterMetrics(fs.writer, reg)
 	}
 }
 
