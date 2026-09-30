@@ -37,6 +37,19 @@ func TestMemKVClient(t *testing.T) {
 	testMeta(t, m)
 }
 
+func TestWriteMultiMemKV(t *testing.T) {
+	_ = os.Remove(settingPath)
+	m, err := newKVMeta("memkv", "jfs-writemulti-test", testConfig())
+	if err != nil || m.Name() != "memkv" {
+		t.Fatalf("create meta: %s", err)
+	}
+	wmFlaky(m)
+	if err := m.Reset(); err != nil {
+		t.Fatalf("reset meta: %s", err)
+	}
+	testWriteMulti(t, m)
+}
+
 func TestTiKVClient(t *testing.T) { //skip mutate
 	m, err := newKVMeta("tikv", "127.0.0.1:2379/jfs-unit-test", testConfig())
 	if err != nil || m.Name() != "tikv" {
