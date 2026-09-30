@@ -604,8 +604,10 @@ func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, 
 			if f.shouldStop() {
 				return 0, f.err
 			}
-			if s.state == INVALID {
-				// Stopped by a failure that a later Read has already cleared.
+			if s.state == INVALID && uint64(s.currentPos) < s.block.len {
+				// Stopped by a failure that a later Read has already cleared. A slice fetched whole and invalidated since
+				// (by a commit, before this read woke) is not: its page holds the bytes it found, which this read, whose
+				// flush came first, may return.
 				return 0, syscall.EIO
 			}
 		}
