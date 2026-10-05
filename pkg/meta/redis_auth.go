@@ -21,8 +21,11 @@ package meta
 
 import (
 	"fmt"
+	"math"
+	"time"
 
 	entraid "github.com/redis/go-redis-entraid"
+	"github.com/redis/go-redis-entraid/manager"
 	"github.com/redis/go-redis/v9"
 	"github.com/redis/go-redis/v9/auth"
 )
@@ -54,5 +57,34 @@ func redisStreamingCredentials(authProvider string, opt *redis.Options, newAzure
 // newAzureRedisCredentials uses the default Azure credential chain, which covers
 // AKS workload identity and managed identity.
 func newAzureRedisCredentials() (auth.StreamingCredentialsProvider, error) {
-	return entraid.NewDefaultAzureCredentialsProvider(entraid.DefaultAzureCredentialsProviderOptions{})
+	return entraid.NewDefaultAzureCredentialsProvider(azureRedisCredentialsOptions())
+}
+
+func azureRedisCredentialsOptions() entraid.DefaultAzureCredentialsProviderOptions {
+	return entraid.DefaultAzureCredentialsProviderOptions{
+		CredentialsProviderOptions: entraid.CredentialsProviderOptions{
+			TokenManagerOptions: azureRedisTokenManagerOptions(),
+		},
+	}
+}
+
+// azureRedisTokenManagerOptions makes the token refresh loop retry forever.
+// With the library defaults, the loop gives up after 3 failed attempts or on
+// the first error that is not a network timeout (for example an Entra or IMDS
+// error), and it does not restart while connections stay open. Those
+// connections then fail once the token expires. LangSmith core
+// (smith-go/redisutil/redis_azure.go) retries forever with backoff from 1s to
+// 30s; this matches it.
+func azureRedisTokenManagerOptions() manager.TokenManagerOptions {
+	return manager.TokenManagerOptions{
+		RetryOptions: manager.RetryOptions{
+			IsRetryable: func(error) bool { return true },
+			// The loop is `for i := 0; i < MaxAttempts; i++`, so MaxInt does
+			// not overflow and never runs out in practice.
+			MaxAttempts:       math.MaxInt,
+			InitialDelay:      time.Second,
+			MaxDelay:          30 * time.Second,
+			BackoffMultiplier: 2,
+		},
+	}
 }

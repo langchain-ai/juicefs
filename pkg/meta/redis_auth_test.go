@@ -20,9 +20,18 @@
 package meta
 
 import (
+	"context"
+	"encoding/base64"
 	"errors"
+	"math"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	entraid "github.com/redis/go-redis-entraid"
+	"github.com/redis/go-redis-entraid/manager"
+	"github.com/redis/go-redis-entraid/shared"
 	"github.com/redis/go-redis/v9"
 	"github.com/redis/go-redis/v9/auth"
 	"github.com/stretchr/testify/require"
@@ -85,4 +94,102 @@ func TestRedisStreamingCredentials(t *testing.T) {
 func TestNewRedisMetaRejectsInvalidAuthProvider(t *testing.T) {
 	_, err := newRedisMeta("redis", "localhost:6379/1?auth-provider=azure", testConfig())
 	require.ErrorContains(t, err, "requires a rediss://")
+}
+
+func TestAzureRedisCredentialsOptions(t *testing.T) {
+	opts := azureRedisCredentialsOptions().TokenManagerOptions
+	retry := opts.RetryOptions
+	require.Equal(t, math.MaxInt, retry.MaxAttempts)
+	require.Equal(t, time.Second, retry.InitialDelay)
+	require.Equal(t, 30*time.Second, retry.MaxDelay)
+	require.Equal(t, 2.0, retry.BackoffMultiplier)
+	require.NotNil(t, retry.IsRetryable)
+	// The library default gives up on errors that are not network timeouts.
+	require.True(t, retry.IsRetryable(errors.New("AADSTS700024: client assertion is not within its valid time range")))
+	require.True(t, retry.IsRetryable(context.DeadlineExceeded))
+	// Zero keeps the library default ratio (0.7).
+	require.Zero(t, opts.ExpirationRefreshRatio)
+}
+
+// scriptedIdentityProvider returns tokens or errors from a script, then
+// repeats the last entry.
+type scriptedIdentityProvider struct {
+	mu    sync.Mutex
+	steps []func() (shared.IdentityProviderResponse, error)
+	calls int
+}
+
+func (p *scriptedIdentityProvider) RequestToken(context.Context) (shared.IdentityProviderResponse, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	i := p.calls
+	if i >= len(p.steps) {
+		i = len(p.steps) - 1
+	}
+	p.calls++
+	return p.steps[i]()
+}
+
+func fakeEntraToken(t *testing.T, oid string, ttl time.Duration) func() (shared.IdentityProviderResponse, error) {
+	enc := base64.RawURLEncoding.EncodeToString
+	raw := enc([]byte(`{"alg":"HS256","typ":"JWT"}`)) + "." + enc([]byte(`{"oid":"`+oid+`"}`)) + ".sig"
+	return func() (shared.IdentityProviderResponse, error) {
+		resp, err := shared.NewIDPResponse(shared.ResponseTypeAccessToken, azcore.AccessToken{Token: raw, ExpiresOn: time.Now().Add(ttl)})
+		require.NoError(t, err)
+		return resp, nil
+	}
+}
+
+type recordingListener struct {
+	next chan auth.Credentials
+	errs chan error
+}
+
+func (l *recordingListener) OnNext(c auth.Credentials) { l.next <- c }
+func (l *recordingListener) OnError(err error)         { l.errs <- err }
+
+// TestAzureRedisRefreshSurvivesFailures runs the library token manager with
+// our retry options and a fake identity provider. Six non-timeout failures
+// in a row would stop the loop with the library defaults; with our options
+// the loop keeps retrying and pushes the next good token.
+func TestAzureRedisRefreshSurvivesFailures(t *testing.T) {
+	failure := func() (shared.IdentityProviderResponse, error) {
+		return nil, errors.New("AADSTS700024: client assertion is not within its valid time range")
+	}
+	idp := &scriptedIdentityProvider{steps: []func() (shared.IdentityProviderResponse, error){
+		fakeEntraToken(t, "first-oid", 10*time.Second),
+		failure, failure, failure, failure, failure, failure,
+		fakeEntraToken(t, "second-oid", time.Hour),
+	}}
+
+	opts := azureRedisTokenManagerOptions()
+	// Refresh the first token after ~1% of its lifetime and retry fast; keep
+	// IsRetryable and MaxAttempts as configured.
+	opts.ExpirationRefreshRatio = 0.01
+	opts.RetryOptions.InitialDelay = time.Millisecond
+	opts.RetryOptions.MaxDelay = 5 * time.Millisecond
+	tm, err := manager.NewTokenManager(idp, opts)
+	require.NoError(t, err)
+	cp, err := entraid.NewCredentialsProvider(tm, entraid.CredentialsProviderOptions{TokenManagerOptions: opts})
+	require.NoError(t, err)
+
+	l := &recordingListener{next: make(chan auth.Credentials, 8), errs: make(chan error, 8)}
+	creds, unsubscribe, err := cp.Subscribe(l)
+	require.NoError(t, err)
+	defer func() { _ = unsubscribe() }()
+	user, _ := creds.BasicAuth()
+	require.Equal(t, "first-oid", user)
+
+	select {
+	case c := <-l.next:
+		user, _ := c.BasicAuth()
+		require.Equal(t, "second-oid", user)
+	case err := <-l.errs:
+		t.Fatalf("refresh loop gave up: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("refresh loop did not recover")
+	}
+	idp.mu.Lock()
+	require.GreaterOrEqual(t, idp.calls, 8)
+	idp.mu.Unlock()
 }
