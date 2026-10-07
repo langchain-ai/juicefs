@@ -34,23 +34,6 @@ func TestSQLiteClient(t *testing.T) {
 	testMeta(t, m)
 }
 
-func TestWriteMultiSQLite(t *testing.T) {
-	m, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "jfs-writemulti.db"), testConfig())
-	if err != nil || m.Name() != "sqlite3" {
-		t.Fatalf("create meta: %s", err)
-	}
-	wmFlaky(m)
-	t.Cleanup(func() {
-		if err := m.Shutdown(); err != nil {
-			t.Errorf("shutdown: %s", err)
-		}
-	})
-	if err := m.Reset(); err != nil {
-		t.Fatalf("reset meta: %s", err)
-	}
-	testWriteMulti(t, m)
-}
-
 func TestSQLiteBatchUpdateChunkRefs(t *testing.T) {
 	metaClient, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "jfs-batch-chunk-refs.db"), testConfig())
 	if err != nil {

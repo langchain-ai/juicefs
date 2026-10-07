@@ -332,23 +332,6 @@ type Slice struct {
 	Len  uint32
 }
 
-// SliceWrite is one slice of a WriteMulti call: Slice goes on top of chunk Indx at offset Off, as in Write.
-type SliceWrite struct {
-	Indx  uint32
-	Off   uint32
-	Slice Slice
-}
-
-// WriteMultiLimits bounds one WriteMulti call. The zero value means the engine has no WriteMulti.
-type WriteMultiLimits struct {
-	Slices int // slices in the call
-	Chunks int // distinct chunks in the call
-	// ChunkSlices is the most slices the call may add to any one chunk. It is at most one less than the
-	// slices one compaction takes, so that the compaction that runs when a chunk reaches its slice limit
-	// can absorb one call, and on MySQL it keeps a chunk value within its BLOB column (65535 bytes).
-	ChunkSlices int
-}
-
 // Summary represents the total number of files/directories and
 // total length of all files inside a directory.
 type Summary struct {
