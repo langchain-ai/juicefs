@@ -1436,7 +1436,7 @@ type wmSpoilingKV struct {
 func (c *wmSpoilingKV) txn(ctx context.Context, f func(*kvTxn) error, retry int) error {
 	return c.tkvClient.txn(ctx, func(tx *kvTxn) error {
 		tr := &wmSetTracker{kvtxn: tx.kvtxn, key: c.key}
-		if err := f(&kvTxn{tr, tx.retry}); err != nil {
+		if err := f(&kvTxn{kvtxn: tr, retry: tx.retry}); err != nil {
 			return err
 		}
 		if tr.hit {

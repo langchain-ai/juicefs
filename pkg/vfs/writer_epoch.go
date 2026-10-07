@@ -21,6 +21,8 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,6 +47,83 @@ const (
 	defaultMaxBufferedSlices = 1000
 	defaultMaxPendingSlices  = 10000
 )
+
+// sliceEpoch is the part of a sliceWriter only epoch mode uses.
+type sliceEpoch struct {
+	ep        *epoch    // the epoch the slice was created in, and commits with
+	lastWrite time.Time // the last write into it (lastMod is also set by UpdateMtime)
+}
+
+// fileEpoch is the part of a fileWriter only epoch mode uses (see commitEpochs); protected by the file. Epoch mode also
+// uses the file's commitcond (commitEpochs waits for an epoch, and for its slices to be done), readcond (a read waits
+// for its epoch) and capcond (waitSliceCap).
+type fileEpoch struct {
+	open         *epoch   // the epoch new slices go into
+	queue        []*epoch // closed epochs not yet handled by commitEpochs, oldest first
+	nextEpoch    uint64   // id of the open epoch
+	committing   bool     // commitEpochs is running (it holds a file ref)
+	writes       uint64   // Writes that put data into the file's slices
+	pendingCount int      // slices of the open and queued epochs: every slice in f.chunks
+	donePending  int      // how many of them are done (uploaded, or given up): they hold no write buffers
+	capwaiting   uint16   // writes held back by waitSliceCap
+	// The oldest epoch with a slice whose upload failed (0: none), and that error, as soon as the slice is done
+	// (markDone): its slices and those of newer epochs, which commitEpochs will drop, skip their uploads. f.err is set
+	// only once commitEpochs gets to that epoch, after the older ones commit.
+	failedEpoch uint64
+	failedErr   syscall.Errno
+	bufferStall bool // a write closed the open epoch for the buffer stall, and no write saw the buffer below its size since
+}
+
+// writerEpoch is the part of a dataWriter only epoch mode uses (commitConfig); dataWriter.epochs selects the mode.
+type writerEpoch struct {
+	epochMaxAge       time.Duration
+	epochMaxSlices    int
+	maxBufferedSlices int // per file; see waitSliceCap
+	maxPendingSlices  int
+	sequentialOnce    sync.Once
+	bufferUsed        func() int64 // tests: what epoch mode's write throttle reads instead of usedBufferSize
+	// Times a defensive branch of the epoch writer ran, one that its invariants make unreachable (each also logs an
+	// error). Tests fail when it is not zero (epochState, and the end of each test of the writer).
+	invariantBreaks atomic.Int64
+}
+
+// initCommitMode sets the commit mode of a new writer from JFS_COMMIT_MODE and the epoch settings (commitConfigFromEnv).
+func (w *dataWriter) initCommitMode() {
+	cc, err := commitConfigFromEnv()
+	if err != nil {
+		logger.Fatalf("Invalid writer commit config: %s", err)
+	}
+	w.epochs = cc.epochs
+	w.epochMaxAge = cc.maxAge
+	w.epochMaxSlices = cc.maxSlices
+	w.maxBufferedSlices = defaultMaxBufferedSlices
+	w.maxPendingSlices = defaultMaxPendingSlices
+	if w.epochs {
+		logger.Infof("Writer commits in epochs (JFS_COMMIT_MODE=epoch): each closes %s after its first slice, or after %d slices",
+			w.epochMaxAge, w.epochMaxSlices)
+	}
+}
+
+// initEpochs sets up a new fileWriter for epoch mode (Open).
+func (f *fileWriter) initEpochs() {
+	if f.w.epochs {
+		f.capcond = utils.NewCond(f)
+		f.nextEpoch = 1
+		f.open = newEpoch(f.nextEpoch)
+	}
+}
+
+// chunksToFreeze is what flush freezes the slices of: all of the file's chunks in chunk mode. In epoch mode it closes
+// the open epoch instead, which freezes its slices, and returns none: flushwaiting holds back new writes, so this closes
+// the last epoch the flush waits for, and commitEpochs empties f.chunks once every epoch is handled.
+// protected by file
+func (f *fileWriter) chunksToFreeze() map[uint32]*chunkWriter {
+	if f.w.epochs {
+		f.closeEpoch("flush")
+		return nil
+	}
+	return f.chunks
+}
 
 // Epoch commits: the writer groups the slices of a file into epochs and commits each epoch in one metadata transaction
 // (meta.WriteMulti), oldest first, so what the metadata engine holds after a client crash is the file's content after
@@ -664,12 +743,12 @@ func (f *fileWriter) writeChunkEpoch(ctx meta.Context, indx uint32, off uint32, 
 	now := time.Now()
 	if s == nil {
 		s = &sliceWriter{
-			chunk:   c,
-			off:     off,
-			writer:  f.w.store.NewWriter(0, f.tierID),
-			notify:  utils.NewCond(&f.Mutex),
-			started: now,
-			ep:      e,
+			chunk:      c,
+			off:        off,
+			writer:     f.w.store.NewWriter(0, f.tierID),
+			notify:     utils.NewCond(&f.Mutex),
+			started:    now,
+			sliceEpoch: sliceEpoch{ep: e},
 		}
 		go s.prepareID(meta.Background(), false)
 		c.slices = append(c.slices, s)

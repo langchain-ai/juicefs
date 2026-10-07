@@ -23,6 +23,59 @@ import (
 	"time"
 )
 
+// WriteMultier is the part of Meta that puts many slices of a file in one transaction (JFS_COMMIT_MODE=epoch).
+type WriteMultier interface {
+	// WriteMulti puts every slice on top of its chunk in one transaction: all of them land or none does.
+	// The slices of one chunk are appended in the order given; the order across chunks does not matter.
+	// The length becomes at least the end of the furthest slice, and mtime is set once for the batch.
+	// Every slice must have a distinct non-zero id (from NewSlice), Len > 0, fit in its chunk
+	// (Off+Len <= ChunkSize) and in its object (Slice.Off+Len <= Size); EINVAL otherwise.
+	// A batch over WriteMultiLimits returns E2BIG; an engine without WriteMulti returns ENOTSUP.
+	//
+	// EINVAL, E2BIG, ENOTSUP, EROFS, ENOENT, EPERM, EDQUOT and ENOSPC come from checks made before the
+	// commit: the batch did not land. After any other error (EIO, ETIMEDOUT, ...), which can follow a
+	// commit whose reply was lost, WriteMulti sends the batch again for a while, each time first looking
+	// for it in the same transaction, so a batch that landed returns 0. An error it still returns (EIO,
+	// EINTR, ...) leaves the batch there (whole) or not; the caller must not delete its objects, which the
+	// metadata may refer to.
+	WriteMulti(ctx Context, inode Ino, writes []SliceWrite, mtime time.Time) syscall.Errno
+	// WriteMultiLimits returns the bounds of one WriteMulti call (the zero value without WriteMulti).
+	WriteMultiLimits() WriteMultiLimits
+}
+
+// writeMultiEngine is the part of engine behind WriteMulti.
+type writeMultiEngine interface {
+	// doWriteMulti appends every slice of writes to its chunk in one transaction, all or none. writes is
+	// grouped by chunk in ascending indx (sortSliceWrites), in the caller's order inside a chunk; baseMeta
+	// validated it and checked writeMultiLimits. On success counts[indx] is each chunk's slice count after
+	// the append, delta the length/space growth and attr the new attributes. A non-zero since makes it a
+	// resend of a batch first sent then (resendWriteMulti): the transaction first makes the check of
+	// writeMultiResent, and when it finds the batch there it writes nothing and leaves delta and attr as
+	// they are.
+	doWriteMulti(ctx Context, inode Ino, writes []SliceWrite, mtime, since time.Time, counts map[uint32]int, delta *dirStat, attr *Attr) syscall.Errno
+	// writeMultiLimits bounds one doWriteMulti transaction by what the engine can hold (the zero value when
+	// the engine does not support it). ChunkSlices is the engine's own bound, if any; baseMeta lowers it to
+	// what one compaction absorbs.
+	writeMultiLimits() WriteMultiLimits
+}
+
+// SliceWrite is one slice of a WriteMulti call: Slice goes on top of chunk Indx at offset Off, as in Write.
+type SliceWrite struct {
+	Indx  uint32
+	Off   uint32
+	Slice Slice
+}
+
+// WriteMultiLimits bounds one WriteMulti call. The zero value means the engine has no WriteMulti.
+type WriteMultiLimits struct {
+	Slices int // slices in the call
+	Chunks int // distinct chunks in the call
+	// ChunkSlices is the most slices the call may add to any one chunk. It is at most one less than the
+	// slices one compaction takes, so that the compaction that runs when a chunk reaches its slice limit
+	// can absorb one call, and on MySQL it keeps a chunk value within its BLOB column (65535 bytes).
+	ChunkSlices int
+}
+
 // compactionAfterWrite decides whether a chunk whose slice count went from before to after in one
 // transaction needs a compaction: in the background, or blocking (before the write returns, at
 // maxSlices). A count past writeCompactionDebtThreshold always compacts; otherwise the chunk compacts each
@@ -303,21 +356,4 @@ func (m *baseMeta) WriteMulti(ctx Context, inode Ino, writes []SliceWrite, mtime
 		}
 	}
 	return st
-}
-
-// SliceWrite is one slice of a WriteMulti call: Slice goes on top of chunk Indx at offset Off, as in Write.
-type SliceWrite struct {
-	Indx  uint32
-	Off   uint32
-	Slice Slice
-}
-
-// WriteMultiLimits bounds one WriteMulti call. The zero value means the engine has no WriteMulti.
-type WriteMultiLimits struct {
-	Slices int // slices in the call
-	Chunks int // distinct chunks in the call
-	// ChunkSlices is the most slices the call may add to any one chunk. It is at most one less than the
-	// slices one compaction takes, so that the compaction that runs when a chunk reaches its slice limit
-	// can absorb one call, and on MySQL it keeps a chunk value within its BLOB column (65535 bytes).
-	ChunkSlices int
 }

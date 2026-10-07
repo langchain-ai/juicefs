@@ -20,7 +20,6 @@ import (
 	"math/rand"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -71,9 +70,7 @@ type sliceWriter struct {
 	committed bool
 	dep       *sliceWriter
 
-	// epoch mode
-	ep        *epoch    // the epoch the slice was created in, and commits with
-	lastWrite time.Time // the last write into it (lastMod is also set by UpdateMtime)
+	sliceEpoch // epoch mode (writer_epoch.go)
 }
 
 func (s *sliceWriter) prepareID(ctx meta.Context, retry bool) {
@@ -112,7 +109,7 @@ func (s *sliceWriter) markDone() {
 	f := s.chunk.file
 	f.Lock()
 	s.done = true
-	if f.w.epochs {
+	if f.w.epochs { // writer_epoch.go
 		f.donePending++
 		if e := s.ep; e != nil {
 			e.notDone--
@@ -127,9 +124,10 @@ func (s *sliceWriter) markDone() {
 		if f.capwaiting > 0 {
 			f.capcond.Broadcast()
 		}
-	} else {
-		s.notify.Signal()
+		f.Unlock()
+		return
 	}
+	s.notify.Signal()
 	f.Unlock()
 }
 
@@ -284,26 +282,12 @@ type fileWriter struct {
 	refs         uint16
 	chunks       map[uint32]*chunkWriter
 
-	// epoch mode (see commitEpochs); protected by the file
-	open         *epoch   // the epoch new slices go into
-	queue        []*epoch // closed epochs not yet handled by commitEpochs, oldest first
-	nextEpoch    uint64   // id of the open epoch
-	committing   bool     // commitEpochs is running (it holds a file ref)
-	writes       uint64   // Writes that put data into the file's slices
-	pendingCount int      // slices of the open and queued epochs: every slice in f.chunks
-	donePending  int      // how many of them are done (uploaded, or given up): they hold no write buffers
-	capwaiting   uint16   // writes held back by waitSliceCap
-	// The oldest epoch with a slice whose upload failed (0: none), and that error, as soon as the slice is done
-	// (markDone): its slices and those of newer epochs, which commitEpochs will drop, skip their uploads. f.err is set
-	// only once commitEpochs gets to that epoch, after the older ones commit.
-	failedEpoch uint64
-	failedErr   syscall.Errno
-	bufferStall bool // a write closed the open epoch for the buffer stall, and no write saw the buffer below its size since
+	fileEpoch // epoch mode (writer_epoch.go); protected by the file
 
 	flushcond  *utils.Cond // wait for chunks==nil (flush)
 	writecond  *utils.Cond // wait for flushwaiting==0 (write)
-	commitcond *utils.Cond // chunk mode: wait for committed==true of dependency slice; epoch mode: commitEpochs waits for an epoch, and for its slices to be done
-	readcond   *utils.Cond // wait for committed==true of a slice a read overlaps (flushRange), or of its epoch
+	commitcond *utils.Cond // wait for committed==true of dependency slice (commit)
+	readcond   *utils.Cond // wait for committed==true of a slice a read overlaps (flushRange)
 	capcond    *utils.Cond // wait for fewer pending slices (waitSliceCap)
 }
 
@@ -465,17 +449,11 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	var wait = f.flushTimeout()
 	var deadline = time.Now().Add(wait)
 	for len(f.chunks) > 0 && err == 0 {
-		if f.w.epochs {
-			// flushwaiting holds back new writes, so this closes the last epoch the flush waits for; commitEpochs
-			// empties f.chunks once every epoch is handled.
-			f.closeEpoch("flush")
-		} else {
-			for _, c := range f.chunks {
-				for _, s := range c.slices {
-					if !s.freezed {
-						s.freezed = true
-						go s.flushData()
-					}
+		for _, c := range f.chunksToFreeze() {
+			for _, s := range c.slices {
+				if !s.freezed {
+					s.freezed = true
+					go s.flushData()
 				}
 			}
 		}
@@ -626,24 +604,11 @@ type dataWriter struct {
 	files      map[Ino]*fileWriter
 	maxRetries uint32
 
-	// epoch mode (commitConfig)
-	epochs            bool
-	epochMaxAge       time.Duration
-	epochMaxSlices    int
-	maxBufferedSlices int // per file; see waitSliceCap
-	maxPendingSlices  int
-	sequentialOnce    sync.Once
-	bufferUsed        func() int64 // tests: what epoch mode's write throttle reads instead of usedBufferSize
-	// Times a defensive branch of the epoch writer ran, one that its invariants make unreachable (each also logs an
-	// error). Tests fail when it is not zero (epochState, and the end of each test of the writer).
-	invariantBreaks atomic.Int64
+	epochs      bool // JFS_COMMIT_MODE=epoch (writer_epoch.go)
+	writerEpoch      // epoch mode
 }
 
 func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) DataWriter {
-	cc, err := commitConfigFromEnv()
-	if err != nil {
-		logger.Fatalf("Invalid writer commit config: %s", err)
-	}
 	w := &dataWriter{
 		m:          m,
 		store:      store,
@@ -653,17 +618,8 @@ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader Dat
 		bufferSize: int64(conf.Chunk.BufferSize),
 		files:      make(map[Ino]*fileWriter),
 		maxRetries: uint32(conf.Meta.Retries),
-
-		epochs:            cc.epochs,
-		epochMaxAge:       cc.maxAge,
-		epochMaxSlices:    cc.maxSlices,
-		maxBufferedSlices: defaultMaxBufferedSlices,
-		maxPendingSlices:  defaultMaxPendingSlices,
 	}
-	if w.epochs {
-		logger.Infof("Writer commits in epochs (JFS_COMMIT_MODE=epoch): each closes %s after its first slice, or after %d slices",
-			w.epochMaxAge, w.epochMaxSlices)
-	}
+	w.initCommitMode()
 	go w.flushAll()
 	return w
 }
@@ -720,11 +676,7 @@ func (w *dataWriter) Open(inode Ino, len uint64, tierID uint8) FileWriter {
 		f.writecond = utils.NewCond(f)
 		f.commitcond = utils.NewCond(f)
 		f.readcond = utils.NewCond(f)
-		if w.epochs {
-			f.capcond = utils.NewCond(f)
-			f.nextEpoch = 1
-			f.open = newEpoch(f.nextEpoch)
-		}
+		f.initEpochs()
 		w.files[inode] = f
 	}
 	f.refs++

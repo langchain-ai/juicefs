@@ -139,18 +139,7 @@ type engine interface {
 	doRead(ctx Context, inode Ino, indx uint32) ([]*slice, syscall.Errno)
 	doList(ctx Context, inode Ino) ([]*slice, syscall.Errno)
 	doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno
-	// doWriteMulti appends every slice of writes to its chunk in one transaction, all or none. writes is
-	// grouped by chunk in ascending indx (sortSliceWrites), in the caller's order inside a chunk; baseMeta
-	// validated it and checked writeMultiLimits. On success counts[indx] is each chunk's slice count after
-	// the append, delta the length/space growth and attr the new attributes. A non-zero since makes it a
-	// resend of a batch first sent then (resendWriteMulti): the transaction first makes the check of
-	// writeMultiResent, and when it finds the batch there it writes nothing and leaves delta and attr as
-	// they are.
-	doWriteMulti(ctx Context, inode Ino, writes []SliceWrite, mtime, since time.Time, counts map[uint32]int, delta *dirStat, attr *Attr) syscall.Errno
-	// writeMultiLimits bounds one doWriteMulti transaction by what the engine can hold (the zero value when
-	// the engine does not support it). ChunkSlices is the engine's own bound, if any; baseMeta lowers it to
-	// what one compaction absorbs.
-	writeMultiLimits() WriteMultiLimits
+	writeMultiEngine // doWriteMulti and writeMultiLimits (writemulti.go)
 	doTruncate(ctx Context, inode Ino, flags uint8, length uint64, delta *dirStat, attr *Attr, skipPermCheck bool) syscall.Errno
 	doFallocate(ctx Context, inode Ino, mode uint8, off uint64, size uint64, delta *dirStat, attr *Attr) syscall.Errno
 	doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno

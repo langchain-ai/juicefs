@@ -69,11 +69,7 @@ func (tx *memTxn) get(key []byte) []byte {
 	it := tx.store.get(k)
 	if it != nil {
 		tx.observed[k] = it.ver
-		// A copy, as the other clients return: callers may change the value they get (doCompactChunk
-		// does), which must not change the stored value under other readers or before the commit.
-		v := make([]byte, len(it.value))
-		copy(v, it.value)
-		return v
+		return bytes.Clone(it.value) // callers may change it (doCompactChunk does), as other clients allow
 	} else {
 		tx.observed[k] = 0
 		return nil

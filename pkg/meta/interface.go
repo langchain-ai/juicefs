@@ -472,22 +472,7 @@ type Meta interface {
 	NewSlice(ctx Context, id *uint64) syscall.Errno
 	// Write put a slice of data on top of the given chunk.
 	Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno
-	// WriteMulti puts every slice on top of its chunk in one transaction: all of them land or none does.
-	// The slices of one chunk are appended in the order given; the order across chunks does not matter.
-	// The length becomes at least the end of the furthest slice, and mtime is set once for the batch.
-	// Every slice must have a distinct non-zero id (from NewSlice), Len > 0, fit in its chunk
-	// (Off+Len <= ChunkSize) and in its object (Slice.Off+Len <= Size); EINVAL otherwise.
-	// A batch over WriteMultiLimits returns E2BIG; an engine without WriteMulti returns ENOTSUP.
-	//
-	// EINVAL, E2BIG, ENOTSUP, EROFS, ENOENT, EPERM, EDQUOT and ENOSPC come from checks made before the
-	// commit: the batch did not land. After any other error (EIO, ETIMEDOUT, ...), which can follow a
-	// commit whose reply was lost, WriteMulti sends the batch again for a while, each time first looking
-	// for it in the same transaction, so a batch that landed returns 0. An error it still returns (EIO,
-	// EINTR, ...) leaves the batch there (whole) or not; the caller must not delete its objects, which the
-	// metadata may refer to.
-	WriteMulti(ctx Context, inode Ino, writes []SliceWrite, mtime time.Time) syscall.Errno
-	// WriteMultiLimits returns the bounds of one WriteMulti call (the zero value without WriteMulti).
-	WriteMultiLimits() WriteMultiLimits
+	WriteMultier // WriteMulti and WriteMultiLimits (writemulti.go)
 	// InvalidateChunkCache invalidate chunk cache
 	InvalidateChunkCache(ctx Context, inode Ino, indx uint32) syscall.Errno
 	// CopyFileRange copies part of a file to another one.

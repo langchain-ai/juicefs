@@ -807,14 +807,15 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 		} else {
 			err = syscall.EIO
 		}
-	} else {
+		h.removeOp(ctx)
+		return
+	}
+	n, err = h.reader.Read(ctx, off, buf)
+	for err == syscall.EAGAIN {
 		n, err = h.reader.Read(ctx, off, buf)
-		for err == syscall.EAGAIN {
-			n, err = h.reader.Read(ctx, off, buf)
-		}
-		if err == syscall.ENOENT {
-			err = syscall.EBADF
-		}
+	}
+	if err == syscall.ENOENT {
+		err = syscall.EBADF
 	}
 	h.removeOp(ctx)
 	return
