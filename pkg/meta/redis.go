@@ -177,11 +177,12 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 			}
 		}
 	}
-	creds, err := redisStreamingCredentials(authProvider, opt, newAzureRedisCredentials)
+	creds, err := resolveRedisCredentials(authProvider, opt, defaultRedisCredentialFactories)
 	if err != nil {
 		return nil, err
 	}
-	opt.StreamingCredentialsProvider = creds
+	opt.StreamingCredentialsProvider = creds.streaming
+	opt.CredentialsProviderContext = creds.perConn
 	opt.MaxRetries = conf.Retries
 	if opt.MaxRetries == 0 {
 		opt.MaxRetries = -1 // Redis use -1 to disable retries
@@ -216,6 +217,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 		fopt.Username = opt.Username
 		fopt.Password = opt.Password
 		fopt.StreamingCredentialsProvider = opt.StreamingCredentialsProvider
+		fopt.CredentialsProviderContext = opt.CredentialsProviderContext
 		fopt.TLSConfig = opt.TLSConfig
 		fopt.MaxRetries = opt.MaxRetries
 		fopt.MinRetryBackoff = opt.MinRetryBackoff
@@ -254,6 +256,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 			copt.Username = opt.Username
 			copt.Password = opt.Password
 			copt.StreamingCredentialsProvider = opt.StreamingCredentialsProvider
+			copt.CredentialsProviderContext = opt.CredentialsProviderContext
 			copt.TLSConfig = opt.TLSConfig
 			copt.MaxRetries = opt.MaxRetries
 			copt.MinRetryBackoff = opt.MinRetryBackoff
