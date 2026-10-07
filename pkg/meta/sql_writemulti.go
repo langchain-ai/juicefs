@@ -175,11 +175,13 @@ func (m *dbMeta) doWriteMulti(ctx Context, inode Ino, writes []SliceWrite, mtime
 				return syscall.EIO
 			}
 		}
-		for _, g := range groups {
-			for k, w := range writes[g.start:g.end] {
-				// the position of this slice in its chunk, counted from 1, as doWrite logs it
-				pos := n[g.indx] - (g.end - g.start) + k + 1
-				m.genLog(ctx, s, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, w.Indx, w.Off, w.Slice.Id, w.Slice.Len, attr.Mtime, attr.Mtimensec, pos)
+		if m.fmt.ChangeLog { // as genLog checks: its arguments are not boxed for every slice when the change log is off
+			for _, g := range groups {
+				for k, w := range writes[g.start:g.end] {
+					// the position of this slice in its chunk, counted from 1, as doWrite logs it
+					pos := n[g.indx] - (g.end - g.start) + k + 1
+					m.genLog(ctx, s, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, w.Indx, w.Off, w.Slice.Id, w.Slice.Len, attr.Mtime, attr.Mtimensec, pos)
+				}
 			}
 		}
 		for indx, c := range n {

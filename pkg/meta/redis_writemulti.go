@@ -93,9 +93,12 @@ func (m *redisMeta) doWriteMulti(ctx Context, inode Ino, writes []SliceWrite, mt
 				pipe.IncrBy(ctx, m.usedSpaceKey(), delta.space)
 			}
 			// One WRITE entry per slice, so a changelog reader sees the same entries as for Write. As in
-			// doWrite, the slice count is not known before EXEC; it is logged as 0.
-			for _, w := range writes {
-				m.genLog(ctx, pipe, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, w.Indx, w.Off, w.Slice.Id, w.Slice.Len, attr.Mtime, attr.Mtimensec, 0)
+			// doWrite, the slice count is not known before EXEC; it is logged as 0. Checked here as well as in
+			// genLog, so that its arguments are not boxed for every slice when the change log is off.
+			if m.fmt.ChangeLog {
+				for _, w := range writes {
+					m.genLog(ctx, pipe, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, w.Indx, w.Off, w.Slice.Id, w.Slice.Len, attr.Mtime, attr.Mtimensec, 0)
+				}
 			}
 			return nil
 		})
