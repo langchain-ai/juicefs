@@ -179,6 +179,19 @@ juicefs format --storage wasb \
 
 JuiceFS gets an Entra ID token for `https://redis.azure.com/.default` from the Azure default credential chain (workload identity, managed identity, or `AZURE_*` environment variables) and reauthenticates open connections before each token expires. The Redis username is the `oid` claim of the token. The identity needs a data access policy on the Redis instance. `auth-provider=azure` fails when the URL is not `rediss://` or when a password is set in the URL or in `REDIS_PASSWORD`, `META_PASSWORD`, or `META_PASSWORD_FILE`.
 
+#### Google Cloud IAM authentication
+
+For Memorystore for Redis Cluster with IAM authentication, add `auth-provider=gcp` and omit the username and password. Use the cluster's discovery endpoint:
+
+```shell
+juicefs format --storage gs \
+    ... \
+    "redis://<discovery-address>:6379/1?auth-provider=gcp"
+    pics
+```
+
+JuiceFS gets an access token from Google Application Default Credentials (GKE workload identity, the node service account, or `GOOGLE_APPLICATION_CREDENTIALS`) and logs in as `default` on each new connection, refreshing the token 5 minutes before it expires. Memorystore keeps a connection authenticated after its token expires, so open connections are not reauthenticated. The identity needs `roles/redis.dbConnectionUser`. Use `rediss://` when the cluster has in-transit encryption enabled. `auth-provider=gcp` fails when a password is set in the URL or in `REDIS_PASSWORD`, `META_PASSWORD`, or `META_PASSWORD_FILE`.
+
 ### Valkey
 
 [Valkey](https://valkey.io) is an open-source fork of Redis, created to preserve the project's community-driven governance while remaining highly compatible with the Redis ecosystem. Valkey focuses on maintaining stability, improving performance, and continuing innovation under a neutral approach, ensuring long-term availability for users who rely on Redis-compatible workloads.
