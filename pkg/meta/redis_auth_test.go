@@ -22,6 +22,10 @@ package meta
 import (
 	"context"
 	"errors"
+	"net/url"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"testing"
 	"time"
 
@@ -43,6 +47,7 @@ func TestResolveRedisCredentials(t *testing.T) {
 	factories := redisCredentialFactories{
 		azure: func() (auth.StreamingCredentialsProvider, error) { return stub, nil },
 		gcp:   func() (func(context.Context) (string, string, error), error) { return perConn, nil },
+		aws:   func(string, string) (func(context.Context) (string, string, error), error) { return perConn, nil },
 	}
 	mustParse := func(t *testing.T, uri string) *redis.Options {
 		t.Helper()
@@ -67,7 +72,11 @@ func TestResolveRedisCredentials(t *testing.T) {
 		{name: "gcp over plaintext", provider: "gcp", uri: "redis://localhost:6379/1", wantPerConn: true},
 		{name: "gcp over tls", provider: "gcp", uri: "rediss://localhost:6378/1", wantPerConn: true},
 		{name: "gcp rejects static password", provider: "gcp", uri: "redis://:secret@localhost:6379/1", wantErr: "auth-provider=gcp cannot be combined with a static password"},
-		{name: "unknown provider", provider: "aws", uri: "rediss://localhost:10000/1", wantErr: `unsupported redis auth-provider "aws"`},
+		{name: "aws over tls", provider: "aws", uri: "rediss://iam-user@localhost:6379/1", wantPerConn: true},
+		{name: "aws rejects plaintext", provider: "aws", uri: "redis://iam-user@localhost:6379/1", wantErr: "requires a verified rediss://"},
+		{name: "aws rejects missing username", provider: "aws", uri: "rediss://localhost:6379/1", wantErr: "requires an IAM username"},
+		{name: "aws rejects static password", provider: "aws", uri: "rediss://iam-user:secret@localhost:6379/1", wantErr: "cannot be combined with a static password"},
+		{name: "unknown provider", provider: "unknown", uri: "rediss://localhost:10000/1", wantErr: `unsupported redis auth-provider "unknown"`},
 		{
 			name:      "azure factory error",
 			provider:  "azure",
@@ -159,4 +168,59 @@ func TestNewRedisMetaRejectsInvalidAuthProvider(t *testing.T) {
 
 	_, err = newRedisMeta("redis", ":secret@localhost:6379/1?auth-provider=gcp", testConfig())
 	require.ErrorContains(t, err, "auth-provider=gcp cannot be combined with a static password")
+}
+
+func TestAWSRedisCredentials(t *testing.T) {
+	cfg := aws.Config{Region: "us-east-1", Credentials: credentials.NewStaticCredentialsProvider("test-key", "test-secret", "test-session")}
+	provider := awsRedisCredentials(cfg, "my-cache", "iam-user")
+	username, token, err := provider(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "iam-user", username)
+	u, err := url.Parse("http://" + token)
+	require.NoError(t, err)
+	require.Equal(t, "my-cache", u.Host)
+	require.Equal(t, "connect", u.Query().Get("Action"))
+	require.Equal(t, username, u.Query().Get("User"))
+	require.Equal(t, "900", u.Query().Get("X-Amz-Expires"))
+	require.Equal(t, "test-session", u.Query().Get("X-Amz-Security-Token"))
+	require.Contains(t, u.Query().Get("X-Amz-Credential"), "/us-east-1/elasticache/aws4_request")
+	require.NotEmpty(t, u.Query().Get("X-Amz-Signature"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg.Credentials = aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) { return aws.Credentials{}, ctx.Err() })
+	_, _, err = awsRedisCredentials(cfg, "my-cache", "iam-user")(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestAWSRedisConnectionLifetime(t *testing.T) {
+	factories := redisCredentialFactories{aws: func(string, string) (func(context.Context) (string, string, error), error) {
+		return func(context.Context) (string, string, error) { return "iam-user", "token", nil }, nil
+	}}
+	for _, lifetime := range []time.Duration{0, 13 * time.Hour, time.Hour} {
+		opt, err := redis.ParseURL("rediss://iam-user@localhost:6379")
+		require.NoError(t, err)
+		opt.ConnMaxLifetime = lifetime
+		_, err = resolveRedisCredentials("aws", opt, factories)
+		require.NoError(t, err)
+		expected := lifetime
+		if lifetime == 0 || lifetime > 11*time.Hour {
+			expected = 11 * time.Hour
+		}
+		require.Equal(t, expected, opt.ConnMaxLifetime)
+	}
+}
+
+func TestNewAWSRedisCredentialsRejectsUnsupportedEndpoints(t *testing.T) {
+	for _, addr := range []string{"localhost:6379", "cache.example.com:6379", "cache.serverless.use1.cache.amazonaws.com:6379", "master.cache.example.use1.cache.amazonaws.com,other:6379", "invalid"} {
+		_, err := newAWSRedisCredentials(addr, "iam-user")
+		require.Error(t, err)
+	}
+}
+
+func TestAWSRedisCredentialsRejectsInsecureTLS(t *testing.T) {
+	opt, err := redis.ParseURL("rediss://iam-user@localhost:6379")
+	require.NoError(t, err)
+	opt.TLSConfig.InsecureSkipVerify = true
+	_, err = resolveRedisCredentials("aws", opt, redisCredentialFactories{})
+	require.ErrorContains(t, err, "requires a verified rediss://")
 }

@@ -22,7 +22,15 @@ package meta
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 
 	entraid "github.com/redis/go-redis-entraid"
 	"github.com/redis/go-redis/v9"
@@ -31,10 +39,7 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
-// redisCredentials holds the credentials for an `auth-provider`. Azure
-// reauthenticates open connections before each token expires. GCP authenticates
-// each new connection, since Memorystore keeps a connection authenticated after
-// its token expires.
+// redisCredentials holds streaming Azure or per-connection GCP and AWS credentials.
 type redisCredentials struct {
 	streaming auth.StreamingCredentialsProvider
 	perConn   func(ctx context.Context) (username string, password string, err error)
@@ -43,11 +48,13 @@ type redisCredentials struct {
 type redisCredentialFactories struct {
 	azure func() (auth.StreamingCredentialsProvider, error)
 	gcp   func() (func(ctx context.Context) (string, string, error), error)
+	aws   func(string, string) (func(ctx context.Context) (string, string, error), error)
 }
 
 var defaultRedisCredentialFactories = redisCredentialFactories{
 	azure: newAzureRedisCredentials,
 	gcp:   newGCPRedisCredentials,
+	aws:   newAWSRedisCredentials,
 }
 
 // resolveRedisCredentials resolves the `auth-provider` metadata URL option.
@@ -69,6 +76,24 @@ func resolveRedisCredentials(authProvider string, opt *redis.Options, factories 
 			return redisCredentials{}, fmt.Errorf("create azure redis credentials provider: %w", err)
 		}
 		return redisCredentials{streaming: creds}, nil
+	case "aws":
+		if opt.Password != "" {
+			return redisCredentials{}, fmt.Errorf("redis auth-provider=aws cannot be combined with a static password")
+		}
+		if opt.TLSConfig == nil || opt.TLSConfig.InsecureSkipVerify {
+			return redisCredentials{}, fmt.Errorf("redis auth-provider=aws requires a verified rediss:// metadata URL")
+		}
+		if opt.Username == "" {
+			return redisCredentials{}, fmt.Errorf("redis auth-provider=aws requires an IAM username in the metadata URL")
+		}
+		creds, err := factories.aws(opt.Addr, opt.Username)
+		if err != nil {
+			return redisCredentials{}, fmt.Errorf("create aws redis credentials provider: %w", err)
+		}
+		if opt.ConnMaxLifetime <= 0 || opt.ConnMaxLifetime > 11*time.Hour {
+			opt.ConnMaxLifetime = 11 * time.Hour
+		}
+		return redisCredentials{perConn: creds}, nil
 	case "gcp":
 		if opt.Password != "" {
 			return redisCredentials{}, fmt.Errorf("redis auth-provider=gcp cannot be combined with a static password")
@@ -115,5 +140,49 @@ func gcpRedisCredentials(tokens oauth2.TokenSource) func(ctx context.Context) (s
 			return "", "", fmt.Errorf("get gcp access token for redis: %w", err)
 		}
 		return gcpRedisUsername, token.AccessToken, nil
+	}
+}
+
+func newAWSRedisCredentials(addr, username string) (func(context.Context) (string, string, error), error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid AWS Redis endpoint")
+	}
+	labels := strings.Split(strings.ToLower(host), ".")
+	if len(labels) < 3 || !strings.HasSuffix(strings.ToLower(host), ".cache.amazonaws.com") || strings.Contains(host, ".serverless.") || strings.Contains(host, ",") {
+		return nil, fmt.Errorf("aws redis credentials require a provisioned ElastiCache endpoint")
+	}
+	cacheName := labels[0]
+	switch cacheName {
+	case "master", "replica", "clustercfg":
+		cacheName = labels[1]
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Region == "" {
+		return nil, fmt.Errorf("AWS region is required")
+	}
+	return awsRedisCredentials(cfg, cacheName, username), nil
+}
+
+func awsRedisCredentials(cfg aws.Config, cacheName, username string) func(context.Context) (string, string, error) {
+	signer := v4.NewSigner()
+	return func(ctx context.Context) (string, string, error) {
+		creds, err := cfg.Credentials.Retrieve(ctx)
+		if err != nil {
+			return "", "", fmt.Errorf("retrieve AWS credentials for redis: %w", err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+cacheName+"/", nil)
+		if err != nil {
+			return "", "", fmt.Errorf("invalid ElastiCache name")
+		}
+		req.URL.RawQuery = url.Values{"Action": {"connect"}, "User": {username}, "X-Amz-Expires": {"900"}}.Encode()
+		signed, _, err := signer.PresignHTTP(ctx, creds, req, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "elasticache", cfg.Region, time.Now())
+		if err != nil {
+			return "", "", fmt.Errorf("sign AWS redis credentials: %w", err)
+		}
+		return username, strings.TrimPrefix(signed, "http://"), nil
 	}
 }
