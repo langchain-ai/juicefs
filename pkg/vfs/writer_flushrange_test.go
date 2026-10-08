@@ -97,6 +97,16 @@ func (g *gatedStore) waitBlocked(t *testing.T) {
 	}
 }
 
+// forEachCommitMode runs test with the writer in each commit mode (JFS_COMMIT_MODE, read when the VFS is created).
+func forEachCommitMode(t *testing.T, test func(t *testing.T)) {
+	for _, mode := range []string{"chunk", "epoch"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("JFS_COMMIT_MODE", mode)
+			test(t)
+		})
+	}
+}
+
 func createGatedTestVFS() (*VFS, *gatedStore) {
 	var gated *gatedStore
 	v, _ := createTestVFSWithStore(nil, "", func(inner object.ObjectStorage) object.ObjectStorage {
@@ -161,7 +171,10 @@ func committedSlices(t *testing.T, v *VFS, ino Ino, indx uint32) int {
 	return n
 }
 
+// The flag in chunk mode, where a read with it commits the pending writes of its own range only; in epoch mode a read
+// commits the whole epoch holding them either way (TestEpochReadFlushRangeFlag).
 func TestReadFlushRangeFlag(t *testing.T) {
+	t.Setenv("JFS_COMMIT_MODE", "chunk")
 	for _, tc := range []struct {
 		name, value    string
 		enabled, unset bool
@@ -210,6 +223,10 @@ func TestReadFlushRangeFlag(t *testing.T) {
 
 func TestReadSeesItsOwnPendingWrites(t *testing.T) {
 	t.Setenv("JFS_READ_FLUSH_RANGE", "true")
+	forEachCommitMode(t, testReadSeesItsOwnPendingWrites)
+}
+
+func testReadSeesItsOwnPendingWrites(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
 	ino, fh := newRangeTestFile(t, v)
 	cases := []struct {
@@ -231,8 +248,11 @@ func TestReadSeesItsOwnPendingWrites(t *testing.T) {
 	}
 }
 
+// In chunk mode a read commits the pending writes of its own range only. In epoch mode it commits the whole epoch
+// holding them (TestReadLeavesWritesAfterItsBoundaryPending).
 func TestReadLeavesPendingWritesOutsideItsRange(t *testing.T) {
 	t.Setenv("JFS_READ_FLUSH_RANGE", "true")
+	t.Setenv("JFS_COMMIT_MODE", "chunk")
 	v, _ := createTestVFS(nil, "")
 	ino, fh := newRangeTestFile(t, v)
 	mustWrite(t, v, ino, fh, 0, []byte("read me"))
@@ -256,8 +276,47 @@ func TestReadLeavesPendingWritesOutsideItsRange(t *testing.T) {
 	}
 }
 
+// In epoch mode a read commits the whole epoch it overlaps, and so every write before it: the pending writes of other
+// ranges, written before the read, commit with it; the writes after it stay pending.
+func TestReadLeavesWritesAfterItsBoundaryPending(t *testing.T) {
+	t.Setenv("JFS_READ_FLUSH_RANGE", "true")
+	t.Setenv("JFS_COMMIT_MODE", "epoch")
+	v, _ := createTestVFS(nil, "")
+	ino, fh := newRangeTestFile(t, v)
+	mustWrite(t, v, ino, fh, 0, []byte("read me"))
+	mustWrite(t, v, ino, fh, 3*meta.ChunkSize, []byte("before the read"))
+
+	if got := mustRead(t, v, ino, fh, 0, 7); string(got) != "read me" {
+		t.Fatalf("read %q", got)
+	}
+	for _, indx := range []uint32{0, 3} {
+		if n := committedSlices(t, v, ino, indx); n != 1 {
+			t.Fatalf("chunk %d has %d committed slices after a read of chunk 0, want 1: the read's epoch holds it", indx, n)
+		}
+	}
+	mustWrite(t, v, ino, fh, 5*meta.ChunkSize, []byte("after the read"))
+	// Nothing pending in this range: the read waits for nothing and commits nothing. The background flusher leaves
+	// the new epoch alone for a second after its last write.
+	if got := mustReadWithin(t, 500*time.Millisecond, v, ino, fh, 0, 7); string(got) != "read me" {
+		t.Fatalf("read %q", got)
+	}
+	if n := committedSlices(t, v, ino, 5); n != 0 {
+		t.Fatalf("a write after the read's boundary was committed (%d slices)", n)
+	}
+	if e := v.Fsync(NewLogContext(meta.Background()), ino, 1, fh); e != 0 {
+		t.Fatalf("fsync: %s", e)
+	}
+	if n := committedSlices(t, v, ino, 5); n != 1 {
+		t.Fatalf("chunk 5 has %d committed slices after fsync, want 1", n)
+	}
+}
+
 func TestReadCommitsEarlierSlicesOfTheSameChunk(t *testing.T) {
 	t.Setenv("JFS_READ_FLUSH_RANGE", "true")
+	forEachCommitMode(t, testReadCommitsEarlierSlicesOfTheSameChunk)
+}
+
+func testReadCommitsEarlierSlicesOfTheSameChunk(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
 	ino, fh := newRangeTestFile(t, v)
 	// Far enough apart that the second write cannot extend the first slice.
@@ -278,6 +337,10 @@ func TestReadCommitsEarlierSlicesOfTheSameChunk(t *testing.T) {
 
 func TestReadOfAnAppendedChunkCommitsTheSliceItDependsOn(t *testing.T) {
 	t.Setenv("JFS_READ_FLUSH_RANGE", "true")
+	forEachCommitMode(t, testReadOfAnAppendedChunkCommitsTheSliceItDependsOn)
+}
+
+func testReadOfAnAppendedChunkCommitsTheSliceItDependsOn(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
 	ino, fh := newRangeTestFile(t, v)
 	// Both writes extend the file, so the first slice of chunk 1 depends on the growing slice of chunk 0.
@@ -290,6 +353,10 @@ func TestReadOfAnAppendedChunkCommitsTheSliceItDependsOn(t *testing.T) {
 
 func TestReadAfterOverwriteReturnsTheNewBytes(t *testing.T) {
 	t.Setenv("JFS_READ_FLUSH_RANGE", "true")
+	forEachCommitMode(t, testReadAfterOverwriteReturnsTheNewBytes)
+}
+
+func testReadAfterOverwriteReturnsTheNewBytes(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
 	ino, fh := newRangeTestFile(t, v)
 	mustWrite(t, v, ino, fh, 4096, []byte("aaaaaaaaaa"))
@@ -305,6 +372,10 @@ func TestReadAfterOverwriteReturnsTheNewBytes(t *testing.T) {
 
 func TestReadAheadOfAPendingOverwriteIsReplacedWhenItCommits(t *testing.T) {
 	t.Setenv("JFS_READ_FLUSH_RANGE", "true")
+	forEachCommitMode(t, testReadAheadOfAPendingOverwriteIsReplacedWhenItCommits)
+}
+
+func testReadAheadOfAPendingOverwriteIsReplacedWhenItCommits(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
 	ino, fh := newRangeTestFile(t, v)
 	mustWrite(t, v, ino, fh, 0, bytes.Repeat([]byte("a"), 1<<20))
@@ -324,6 +395,10 @@ func TestReadAheadOfAPendingOverwriteIsReplacedWhenItCommits(t *testing.T) {
 
 func TestWritesProceedWhileAReadWaitsForItsRange(t *testing.T) {
 	t.Setenv("JFS_READ_FLUSH_RANGE", "true")
+	forEachCommitMode(t, testWritesProceedWhileAReadWaitsForItsRange)
+}
+
+func testWritesProceedWhileAReadWaitsForItsRange(t *testing.T) {
 	v, gated := createGatedTestVFS()
 	ino, fh := newRangeTestFile(t, v)
 	gated.close()

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -352,4 +353,122 @@ func TestReadDuringCommitsSeesThemInOrder(t *testing.T) {
 		}
 	}
 	t.Fatalf("read returned %s, a state the file was never in", runs(got))
+}
+
+// A read that waited for its slice to be fetched returns the fetched bytes even when a commit invalidates the slice
+// between the end of the fetch and the moment the read wakes: the fetch started after the read's flush, so what it
+// found is the file as it was during the read. The read used to take the invalidated slice for one stopped by a failure
+// and return EIO.
+func TestReadOfASliceInvalidatedBeforeTheReadWakesReturnsItsBytes(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.Background())
+	fe, fh, e := v.Create(ctx, 1, "invalidated-while-waiting", 0644, 0, syscall.O_RDWR)
+	if e != 0 {
+		t.Fatalf("create: %s", e)
+	}
+	ino := fe.Inode
+	data := make([]byte, 1<<20)
+	for i := range data {
+		data[i] = byte(i / 4096)
+	}
+	writeAndSync(t, v, ino, fh, 0, data)
+
+	// Commits of other writes to the file invalidate its whole range, again and again.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			v.reader.Invalidate(ino, 0, uint64(len(data)))
+			time.Sleep(100 * time.Microsecond) // longer than a fetch from memory, so a fetch gets in between
+		}
+	}()
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+	for i := 0; i < 2000; i++ {
+		off := uint64(i%16) << 16
+		if got := waitRead(t, startRead(v, ino, fh, off, 64<<10)); !bytes.Equal(got, data[off:off+64<<10]) {
+			t.Fatalf("read %d at %d returned %d bytes that are not the file's", i, off, len(got))
+		}
+	}
+}
+
+// failIDChunkStore fails every fetch of the slice whose id is fail.
+type failIDChunkStore struct {
+	chunk.ChunkStore
+	fail uint64
+}
+
+func (s *failIDChunkStore) NewReader(id uint64, length int) chunk.Reader {
+	r := s.ChunkStore.NewReader(id, length)
+	if id != s.fail {
+		return r
+	}
+	failing := new(atomic.Bool)
+	failing.Store(true)
+	return &faultyChunkReader{r, failing}
+}
+
+// A read waiting for a slice whose fetch gave up still fails when a later read on the handle has cleared the error of
+// the failure (#17) before the waiting read woke: the slice is INVALID with nothing fetched, and nothing would wake the
+// read again. The check that fails it must not take such a slice for one a commit invalidated after its fetch.
+func TestReadOfASliceWhoseFetchFailedFailsAfterALaterReadClearsTheError(t *testing.T) {
+	v, _ := createTestVFS(func(c *meta.Config) { c.Retries = 1 }, "") // the failing fetch gives up after its second try
+	ctx := NewLogContext(meta.Background())
+	fe, fhw, e := v.Create(ctx, 1, "fetch-failed", 0644, 0, syscall.O_RDWR)
+	if e != 0 {
+		t.Fatalf("create: %s", e)
+	}
+	ino := fe.Inode
+	bs := uint64(v.Conf.Chunk.BlockSize)
+	writeAndSync(t, v, ino, fhw, 0, fill('a', int(bs)))
+	writeAndSync(t, v, ino, fhw, bs, fill('b', int(bs)))
+	held, failed := sliceAt(t, v, ino, 0), sliceAt(t, v, ino, uint32(bs))
+	fetches := newIOGate()
+	r := NewDataReader(v.Conf, v.Meta, &gatedChunkStore{&failIDChunkStore{v.Store, failed}, fetches})
+	v.reader = r
+	v.writer.(*dataWriter).reader = r
+	_, fh, e := v.Open(ctx, ino, syscall.O_RDONLY)
+	if e != 0 {
+		t.Fatalf("open: %s", e)
+	}
+	fr := v.findHandle(ino, fh).reader.(*fileReader)
+
+	fetches.hold()
+	fetches.let(failed)
+	read := startRead(v, ino, fh, 0, int(2*bs)) // waits for block 0, held; the fetch of block 1 fails
+	fetches.waitBlocked(t, held)
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		fr.Lock()
+		failed := fr.err != 0
+		fr.Unlock()
+		if failed {
+			break
+		}
+		if time.Now().After(deadline) {
+			fetches.open()
+			t.Fatal("the fetch of block 1 did not give up")
+		}
+	}
+	// A later read clears the error; it reads past the end, so it returns at once and leaves the waiting read alone.
+	if n, e := v.Read(ctx, ino, make([]byte, 1), 2*bs, fh); n != 0 || e != 0 {
+		t.Fatalf("read past the end: %d bytes, %v", n, e)
+	}
+	fetches.open() // block 0 is fetched; the read then waits for block 1
+	select {
+	case res := <-read:
+		if res.err != syscall.EIO {
+			t.Fatalf("read of a slice whose fetch failed: %d bytes, %v, want EIO", len(res.data), res.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the read of a slice whose fetch failed did not return")
+	}
 }

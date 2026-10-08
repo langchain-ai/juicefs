@@ -69,7 +69,7 @@ func (tx *memTxn) get(key []byte) []byte {
 	it := tx.store.get(k)
 	if it != nil {
 		tx.observed[k] = it.ver
-		return it.value
+		return bytes.Clone(it.value) // callers may change it (doCompactChunk does), as other clients allow
 	} else {
 		tx.observed[k] = 0
 		return nil

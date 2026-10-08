@@ -35,6 +35,8 @@ type Writer interface {
 	FlushTo(offset int) error
 	Finish(length int) error
 	Abort()
+	// AbortAfterUploads is Abort that first waits for the uploads in flight, so no object is left behind.
+	AbortAfterUploads()
 }
 
 type ChunkStore interface {

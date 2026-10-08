@@ -69,6 +69,8 @@ type sliceWriter struct {
 	growing   bool
 	committed bool
 	dep       *sliceWriter
+
+	sliceEpoch // epoch mode (writer_epoch.go)
 }
 
 func (s *sliceWriter) prepareID(ctx meta.Context, retry bool) {
@@ -89,6 +91,9 @@ func (s *sliceWriter) prepareID(ctx meta.Context, retry bool) {
 			}
 			break
 		}
+		if f.w.epochs && s.dropped() != 0 {
+			break // this slice will be dropped (flushData): stop waiting for the metadata engine
+		}
 		f.Unlock()
 		logger.Debugf("meta is not available: %s", st)
 		time.Sleep(time.Millisecond * 100)
@@ -104,6 +109,24 @@ func (s *sliceWriter) markDone() {
 	f := s.chunk.file
 	f.Lock()
 	s.done = true
+	if f.w.epochs { // writer_epoch.go
+		f.donePending++
+		if e := s.ep; e != nil {
+			e.notDone--
+			e.lastDone = time.Now()
+			if s.err != 0 && (f.failedEpoch == 0 || e.id < f.failedEpoch) {
+				f.failedEpoch, f.failedErr = e.id, s.err // e will fail, and every newer epoch be dropped
+			}
+		}
+		// Broadcast, not Signal: Signal is a non-blocking send, lost if it lands between a waiter's Unlock and its
+		// select. commitEpochs waits for every slice of its epoch to be done.
+		f.commitcond.Broadcast()
+		if f.capwaiting > 0 {
+			f.capcond.Broadcast()
+		}
+		f.Unlock()
+		return
+	}
 	s.notify.Signal()
 	f.Unlock()
 }
@@ -114,17 +137,24 @@ func (s *sliceWriter) flushData() {
 	if s.slen == 0 {
 		return
 	}
+	epochs := s.chunk.file.w.epochs
+	if epochs && s.dropIfFailed() {
+		return
+	}
 	s.prepareID(meta.Background(), true)
+	if epochs && s.dropIfFailed() {
+		return
+	}
 	if s.err != 0 {
 		logger.Infof("flush inode: %v chunk: %d err: %s", s.chunk.file.inode, s.id, s.err)
-		s.writer.Abort()
+		s.abort()
 		return
 	}
 	s.length = s.slen
 	if err := s.writer.Finish(int(s.length)); err != nil {
 		logger.Errorf("upload inode: %v chunk: %v (length: %v) fail: %s", s.chunk.file.inode, s.id, s.length, err)
 
-		s.writer.Abort()
+		s.abort()
 		s.err = syscall.EIO
 	}
 }
@@ -141,6 +171,7 @@ func (s *sliceWriter) write(ctx meta.Context, off uint32, data []uint8) syscall.
 		s.slen = off + uint32(len(data))
 	}
 	s.lastMod = time.Now()
+	s.lastWrite = s.lastMod
 	if s.slen == meta.ChunkSize {
 		s.freezed = true
 		go s.flushData()
@@ -251,10 +282,13 @@ type fileWriter struct {
 	refs         uint16
 	chunks       map[uint32]*chunkWriter
 
+	fileEpoch // epoch mode (writer_epoch.go); protected by the file
+
 	flushcond  *utils.Cond // wait for chunks==nil (flush)
 	writecond  *utils.Cond // wait for flushwaiting==0 (write)
 	commitcond *utils.Cond // wait for committed==true of dependency slice (commit)
 	readcond   *utils.Cond // wait for committed==true of a slice a read overlaps (flushRange)
+	capcond    *utils.Cond // wait for fewer pending slices (waitSliceCap)
 }
 
 // protected by file
@@ -277,6 +311,9 @@ func (f *fileWriter) freeChunk(c *chunkWriter) {
 
 // protected by file
 func (f *fileWriter) writeChunk(ctx meta.Context, indx uint32, off uint32, data []byte) syscall.Errno {
+	if f.w.epochs {
+		return f.writeChunkEpoch(ctx, indx, off, data)
+	}
 	c := f.findChunk(indx)
 	s := c.findWritableSlice(off, uint32(len(data)))
 	if s == nil {
@@ -335,6 +372,9 @@ func (w *dataWriter) usedBufferSize() int64 {
 }
 
 func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Errno {
+	if f.w.epochs {
+		return f.writeEpoch(ctx, off, data)
+	}
 	for f.totalSlices() >= 1000 {
 		time.Sleep(time.Millisecond)
 	}
@@ -409,7 +449,7 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	var wait = f.flushTimeout()
 	var deadline = time.Now().Add(wait)
 	for len(f.chunks) > 0 && err == 0 {
-		for _, c := range f.chunks {
+		for _, c := range f.chunksToFreeze() {
 			for _, s := range c.slices {
 				if !s.freezed {
 					s.freezed = true
@@ -467,6 +507,9 @@ func (c *chunkWriter) freezeThrough(i int) {
 // does not hold back writes to the file: a write issued while a read waits may or may not be visible to that read.
 // Pending writes outside the range are left to the background flusher.
 func (f *fileWriter) flushRange(ctx meta.Context, off, size uint64) syscall.Errno {
+	if f.w.epochs {
+		return f.flushRangeEpoch(ctx, off, size)
+	}
 	if size == 0 {
 		return 0
 	}
@@ -560,6 +603,9 @@ type dataWriter struct {
 	bufferSize int64
 	files      map[Ino]*fileWriter
 	maxRetries uint32
+
+	epochs      bool // JFS_COMMIT_MODE=epoch (writer_epoch.go)
+	writerEpoch      // epoch mode
 }
 
 func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) DataWriter {
@@ -573,6 +619,7 @@ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader Dat
 		files:      make(map[Ino]*fileWriter),
 		maxRetries: uint32(conf.Meta.Retries),
 	}
+	w.initCommitMode()
 	go w.flushAll()
 	return w
 }
@@ -584,6 +631,12 @@ func (w *dataWriter) flushAll() {
 		for _, f := range w.files {
 			f.refs++
 			w.Unlock()
+			if w.epochs {
+				f.flushEpochsInBackground(now)
+				w.free(f)
+				w.Lock()
+				continue
+			}
 			tooMany := f.totalSlices() > 800
 			f.Lock()
 
@@ -623,6 +676,7 @@ func (w *dataWriter) Open(inode Ino, len uint64, tierID uint8) FileWriter {
 		f.writecond = utils.NewCond(f)
 		f.commitcond = utils.NewCond(f)
 		f.readcond = utils.NewCond(f)
+		f.initEpochs()
 		w.files[inode] = f
 	}
 	f.refs++

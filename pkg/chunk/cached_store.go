@@ -503,8 +503,10 @@ func (s *wSlice) Finish(length int) error {
 	if err := s.FlushTo(n * s.store.conf.BlockSize); err != nil {
 		return err
 	}
-	for i := 0; i < s.pendings; i++ {
-		if err := <-s.errors; err != nil {
+	for s.pendings > 0 { // counted down, so AbortAfterUploads waits only for the uploads not read here
+		err := <-s.errors
+		s.pendings--
+		if err != nil {
 			s.uploadError = err
 			return err
 		}

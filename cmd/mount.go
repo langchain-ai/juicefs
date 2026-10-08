@@ -549,6 +549,10 @@ func mount(c *cli.Context) error {
 	addr := c.Args().Get(0)
 	removePassword(addr)
 	mp := c.Args().Get(1)
+	// Before the mount daemonizes: after that an invalid config would stop it with the error in the log only.
+	if err := vfs.CheckCommitConfig(); err != nil {
+		return err
+	}
 
 	stage := getDaemonStage()
 	if stage < 0 || stage > 2 {

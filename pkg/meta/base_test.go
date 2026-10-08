@@ -184,6 +184,7 @@ func testMeta(t *testing.T, m Meta) {
 	testCompaction(t, m, false)
 	time.Sleep(time.Second)
 	testCompaction(t, m, true)
+	testWriteMulti(t, m)
 	testCopyFileRange(t, m)
 	testCloseSession(t, m)
 	testConcurrentDir(t, m)
