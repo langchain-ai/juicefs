@@ -367,7 +367,9 @@ func testWriteMultiResend(t *testing.T, m Meta, e *wmFlakyEngine) {
 				t.Fatalf("length %d, want %d", l, length)
 			}
 			if tc.single && tc.plan[0] == "landed" {
-				return // the Write that landed counted its growth nowhere: the dir stats of the batch are lost
+				// The Write that landed lost its count with its reply: the batch's growth is missing from the dir
+				// stats and quotas (and on SQL and TKV from the used space).
+				return
 			}
 			if err := waitCheckResult(m, dirStat{length: int64(length), space: align4K(length), inodes: 1}, func() (*dirStat, syscall.Errno) {
 				return m.GetDirStat(ctx, dir)

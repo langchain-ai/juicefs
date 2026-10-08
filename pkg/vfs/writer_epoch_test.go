@@ -396,7 +396,7 @@ func committedLength(commits []epochCommit) uint64 {
 	return length
 }
 
-// testMetaURL is the metadata engine of the property tests besides memkv, if any: JFS_TEST_META_URL, for example
+// testMetaURLs returns the metadata engines of the property tests: memkv, plus JFS_TEST_META_URL if set, for example
 // redis://127.0.0.1:6379/1 (its database is flushed) or sqlite3:///tmp/epoch-test.db.
 func testMetaURLs() []string {
 	urls := []string{"memkv://"}
@@ -802,7 +802,7 @@ func TestCommitConfigFromEnv(t *testing.T) {
 }
 
 // A writer in epoch mode registers its metrics, each series present (at zero) before its first event, under the names
-// the EXP-050 sampler reads; one in chunk mode registers none of them.
+// an external metrics sampler reads; one in chunk mode registers none of them.
 func TestWriterMetricsAreRegisteredInEpochModeOnly(t *testing.T) {
 	want := map[string]int{
 		"juicefs_writer_epochs_total": len(epochOutcomes), "juicefs_writer_epoch_closed_total": len(epochCloseReasons),

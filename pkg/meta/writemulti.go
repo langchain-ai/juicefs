@@ -37,7 +37,13 @@ type WriteMultier interface {
 	// commit whose reply was lost, WriteMulti sends the batch again for a while, each time first looking
 	// for it in the same transaction, so a batch that landed returns 0. An error it still returns (EIO,
 	// EINTR, ...) leaves the batch there (whole) or not; the caller must not delete its objects, which the
-	// metadata may refer to.
+	// metadata may refer to. When other clients write the same file, a resend relies on their clocks not
+	// being behind this client's (see writeMultiResent).
+	//
+	// A batch that a resend finds landed is not counted again, and the send that landed may not have
+	// reported its count: its growth can then be missing from the dir stats, quotas and used space. This
+	// happens for a batch of one slice (sent first as a Write) on every engine, and for any batch on MySQL
+	// (see dbMeta.doWriteMulti).
 	WriteMulti(ctx Context, inode Ino, writes []SliceWrite, mtime time.Time) syscall.Errno
 	// WriteMultiLimits returns the bounds of one WriteMulti call (the zero value without WriteMulti).
 	WriteMultiLimits() WriteMultiLimits
@@ -166,10 +172,12 @@ func writeMultiRefused(st syscall.Errno) bool {
 
 // resendWriteMulti sends a batch again, after a backoff, while its last send failed with an error that can follow a
 // commit that landed (a connection lost before the reply, a timeout), up to writeMultiResendTries times. Such a failure
-// would otherwise be final, and the epoch writer fails the whole file on it. A resend is safe: its transaction first
-// looks for the batch (writeMultiResent), in the same transaction as the write, so the first send cannot land in
-// between unseen, even late; it writes nothing when the batch is there, or when it cannot tell (the inode changed
-// since the first send), which ends the resends with EIO.
+// would otherwise be final, and the epoch writer fails the whole file on it. A resend does not apply the batch twice:
+// its transaction first looks for the batch (writeMultiResent), in the same transaction as the write, so the first
+// send cannot land in between unseen, even late; it writes nothing when the batch is there, or when it cannot tell
+// (the inode changed since the first send), which ends the resends with EIO. Whether the inode changed is judged
+// from its ctime, so this holds only as far as the clocks of the clients that write the file agree (see
+// writeMultiResent).
 func (m *baseMeta) resendWriteMulti(ctx Context, inode Ino, n int, st syscall.Errno, resend func() syscall.Errno) syscall.Errno {
 	backoff := writeMultiResendBackoff
 	for try := 0; st != 0 && st != errWriteMultiUnknown && !writeMultiRefused(st) && try < writeMultiResendTries && !ctx.Canceled(); try++ {
@@ -194,6 +202,17 @@ func (m *baseMeta) resendWriteMulti(ctx Context, inode Ino, n int, st syscall.Er
 // otherwise it may have landed and been compacted away since, or the inode changed for another reason, and it returns
 // errWriteMultiUnknown. A zero since skips the ctime rule (tkv checks for the batch in every transaction, see its
 // doWriteMulti). It reads the ids in place, as tkv runs it in every transaction of a batch.
+//
+// The ctime rule compares the inode's ctime, which the last client to change the inode set from its own clock, with
+// since, from this client's clock. With only this client changing the file from the first send on (one writer per
+// file, whose clock does not step back), it never misses a landed batch. With other clients writing the same file,
+// it assumes their clocks are not behind this one by more than the time since the first send: if, within the resend
+// window (about 26 s), a client with a lagging clock writes the file and a compaction absorbs every slice of a batch
+// that landed, the ctime is older than since, none of the ids is found, and the batch is applied a second time. since
+// is not lowered by a margin for clock skew: the commit before the batch set the ctime about one commit interval
+// before since (the epoch writer commits a file written steadily about every 5 s by default, more often when its
+// epochs fill up or its commits queue), so a margin longer than the time between two commits of the file would end
+// most resends of a batch that did not land in EIO, which fails the file.
 func writeMultiResent(inode Ino, groups []sliceWriteGroup, writes []SliceWrite, chunks [][]byte, attr *Attr, since time.Time, counts map[uint32]int) (bool, syscall.Errno) {
 	ids := make(map[uint64]struct{}, len(writes))
 	for _, w := range writes {

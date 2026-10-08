@@ -190,6 +190,8 @@ var (
 		Help: "Slices still taking writes when their epoch closed, by the reason of the close: writes that would have " +
 			"extended them start new slices.",
 	}, []string{"reason"})
+	// Observed by flushRangeEpoch only, so with JFS_READ_FLUSH_RANGE=true: with it off, a read in epoch mode waits in
+	// Flush, which this does not count.
 	writerReadEpochWait = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "writer_read_epoch_wait_seconds",
 		Help:    "Time a read waited for the epoch holding the newest pending write it overlaps to commit.",
@@ -254,10 +256,11 @@ type commitConfig struct {
 	maxSlices int           // JFS_EPOCH_MAX_SLICES: the most slices in one epoch
 }
 
-// commitConfigFromEnv reads the commit config. An unset or empty variable takes its default; any other value must be
-// exactly a valid one (no case folding, no surrounding spaces). An invalid value is an error, not a default: a typo must
-// not run the other arm of an A/B, or its parameters, without anyone noticing (NewDataWriter refuses to start). The
-// epoch settings are checked in chunk mode too, which ignores them.
+// commitConfigFromEnv reads the commit config. An unset or empty variable takes its default; any other value must be a
+// valid one: the mode exactly (no case folding, no surrounding spaces), the numbers as strconv.Atoi reads them (a leading
+// + and leading zeros pass; spaces do not). An invalid value is an error, not a default: a typo must not run the other
+// arm of an A/B, or its parameters, without anyone noticing (NewDataWriter refuses to start). The epoch settings are
+// checked in chunk mode too, which ignores them.
 func commitConfigFromEnv() (commitConfig, error) {
 	c := commitConfig{maxAge: defaultEpochMaxAge, maxSlices: defaultEpochMaxSlices}
 	switch mode := os.Getenv("JFS_COMMIT_MODE"); mode {

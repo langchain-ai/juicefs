@@ -84,7 +84,10 @@ func insertWriteRefs(s *xorm.Session, writes []SliceWrite) error {
 // the node row is locked and looks for the batch (writeMultiResent): a send of it that commits late holds
 // that lock, so it is either seen or waited for. A retry by txn after a lost connection (MySQL, Postgres)
 // does not look: if the commit landed, the retry fails on the chunk_ref rows of the batch's slices, which
-// are already there, and the resend that follows finds the batch. (Looking in every retry would make each
+// are already there, and the resend that follows finds the batch. On MySQL, whose txn retries a lost
+// connection even after the commit was sent, and duplicate keys too, that takes all of txn's tries (about
+// 40 s, with the file lock held), and the retry, which finds the length already grown, has set delta to
+// zero: the batch's growth is not counted (see WriteMulti). (Looking in every retry would make each
 // longer, and on SQLite, whose writers fail a transaction whose reads another writer has overtaken, a
 // retry after a conflict would keep failing.)
 func (m *dbMeta) doWriteMulti(ctx Context, inode Ino, writes []SliceWrite, mtime, since time.Time, counts map[uint32]int, delta *dirStat, attr *Attr) syscall.Errno {
