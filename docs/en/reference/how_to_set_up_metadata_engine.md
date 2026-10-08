@@ -138,6 +138,18 @@ export META_PASSWORD_FILE=/secret/mypassword.txt
 juicefs mount -d "redis://192.168.1.6:6379/1" /mnt/jfs
 ```
 
+#### AWS ElastiCache IAM authentication
+
+Use `auth-provider=aws` with a provisioned ElastiCache replication-group primary, reader, or configuration endpoint and an IAM-enabled Redis username:
+
+```shell
+AWS_REGION=us-east-1 juicefs mount 'rediss://iam-user@master.my-cache.example.use1.cache.amazonaws.com:6379/0?auth-provider=aws' /mnt/jfs
+```
+
+The IAM user's user ID and username must match. Grant the workload `elasticache:Connect` on both the replication group and user. The AWS SDK default credential chain supports instance roles and workload identity; configure the region through `AWS_REGION` or shared AWS configuration. Do not set a static password through the URL, `REDIS_PASSWORD`, `META_PASSWORD`, or `META_PASSWORD_FILE`. TLS certificate verification is required.
+
+JuiceFS generates a fresh 15-minute SigV4 token for each new connection and limits connection lifetime to 11 hours, below ElastiCache's 12-hour IAM connection limit. Shorter configured lifetimes are preserved. The replication-group name is derived from the endpoint, stripping `master.`, `replica.`, or `clustercfg.` when present. Custom DNS aliases, individual node endpoints, ElastiCache Serverless, and Redis Sentinel are not supported for this provider.
+
 #### Set up TLS
 
 JuiceFS supports both TLS server-side encryption authentication and mTLS mutual encryption authentication connections to Redis. When connecting to Redis via TLS or mTLS, use the `rediss://` protocol header. However, when using TLS server-side encryption authentication, it is not necessary to specify the client certificate and private key.
