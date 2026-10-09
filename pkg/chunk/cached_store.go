@@ -159,7 +159,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		}
 	}
 
-	block, err := s.store.group.Execute(key, func() (*Page, error) {
+	block, err := s.store.executeShared(ctx, key, func() (*Page, error) {
 		tmp := page
 		if boff > 0 || len(p) < blockSize {
 			tmp = NewOffPage(blockSize)
