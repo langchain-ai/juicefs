@@ -5297,6 +5297,9 @@ func (m *redisMeta) loadQuotasForDump(ctx Context, quotaKey string) map[uint64]*
 }
 
 func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, originAttr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno {
+	// The first watched key picks the txn's local pessimistic lock. Lead with the new inode, which only
+	// this clone touches, so concurrent clones of one source (a burst of boxes from one snapshot) run in
+	// parallel instead of queueing on the source's lock; the source keys are still watched.
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		a, err := tx.Get(ctx, m.inodeKey(srcIno)).Bytes()
 		if err != nil {
@@ -5352,6 +5355,25 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 			}
 		}
 
+		// Read every chunk list in one round trip rather than one per chunk: a multi-GiB
+		// image has dozens of chunks, and the sequential reads dominated the clone.
+		var chunkVals [][]string
+		if attr.Typ == TypeFile && attr.Length != 0 {
+			cmds := make([]*redis.StringSliceCmd, attr.Length/ChunkSize+1)
+			if _, err := tx.Pipelined(ctx, func(p redis.Pipeliner) error {
+				for i := range cmds {
+					cmds[i] = p.LRange(ctx, m.chunkKey(srcIno, uint32(i)), 0, -1)
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			chunkVals = make([][]string, len(cmds))
+			for i, cmd := range cmds {
+				chunkVals[i] = cmd.Val()
+			}
+		}
+
 		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
 			p.Set(ctx, m.inodeKey(ino), m.marshal(&attr), 0)
 			p.IncrBy(ctx, m.usedSpaceKey(), align4K(attr.Length))
@@ -5385,16 +5407,7 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 			case TypeFile:
 				// copy chunks
 				if attr.Length != 0 {
-					var vals [][]string
-					for i := 0; i <= int(attr.Length/ChunkSize); i++ {
-						val, err := tx.LRange(ctx, m.chunkKey(srcIno, uint32(i)), 0, -1).Result()
-						if err != nil {
-							return err
-						}
-						vals = append(vals, val)
-					}
-
-					for i, sv := range vals {
+					for i, sv := range chunkVals {
 						if len(sv) == 0 {
 							continue
 						}
@@ -5421,7 +5434,7 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 			return nil
 		})
 		return err
-	}, m.inodeKey(srcIno), m.xattrKey(srcIno)))
+	}, m.inodeKey(ino), m.inodeKey(srcIno), m.xattrKey(srcIno)))
 }
 
 func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, result *batchCloneResult) syscall.Errno {
