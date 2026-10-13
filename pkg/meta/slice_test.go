@@ -240,6 +240,23 @@ func TestPlanKeepCompactionNothingToDo(t *testing.T) {
 	}
 }
 
+func TestCompactOnRead(t *testing.T) {
+	for _, c := range []struct {
+		runs, entries, visible int
+		want                   bool
+	}{
+		{4, 4, 4, false},
+		{5, 5, 3, true},
+		{4, 4, 7, true},   // few entries, but fragmented
+		{2, 6, 11, false}, // a chunk compacted by planKeepCompaction
+		{4, 9, 15, false},
+	} {
+		if got := compactOnRead(c.runs, c.entries, c.visible); got != c.want {
+			t.Errorf("compactOnRead(%d, %d, %d) = %v", c.runs, c.entries, c.visible, got)
+		}
+	}
+}
+
 func TestSliceRuns(t *testing.T) {
 	ss := []*slice{base64M(), newSlice(0, 2, 8192, 0, 4096), newSlice(8192, 2, 8192, 4096, 4096),
 		newSlice(0, 0, 0, 0, 4096), newSlice(0, 0, 0, 0, 4096), newSlice(0, 3, 4096, 0, 4096)}

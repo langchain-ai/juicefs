@@ -2143,7 +2143,8 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 	// A chunk compacted by planKeepCompaction has many entries of one slice, and
 	// as many visible pieces; count it by runs so reading it doesn't compact again.
 	runs := sliceRuns(ss)
-	if !m.conf.ReadOnly && (runs >= 5 || runs == len(ss) && len(*slices) >= 5) {
+	if !m.conf.ReadOnly && compactOnRead(runs, len(ss), len(*slices)) &&
+		(runs >= keepReadTrigger || !m.keepsShared(f, inode, ss)) {
 		tierID := -1
 		if f != nil {
 			tierID = int(f.attr.Tier)
@@ -2321,6 +2322,7 @@ func (m *baseMeta) SetXattr(ctx Context, inode Ino, name string, value []byte, f
 	}
 
 	defer m.timeit("SetXattr", time.Now())
+	defer m.forgetProfile(inode, name)
 	return m.en.doSetXattr(ctx, m.checkRoot(inode), name, value, flags)
 }
 
@@ -2333,6 +2335,7 @@ func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 	}
 
 	defer m.timeit("RemoveXattr", time.Now())
+	defer m.forgetProfile(inode, name)
 	return m.en.doRemoveXattr(ctx, m.checkRoot(inode), name)
 }
 
@@ -2952,6 +2955,34 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 		delete(m.compacting, k)
 		m.Unlock()
 		m.compactChunk(inode, indx, once, force, tierID)
+	}
+}
+
+// keepsShared reports whether the open file f is a VM disk whose chunk ss would
+// be compacted by planKeepCompaction. The profile is read once per open file.
+func (m *baseMeta) keepsShared(f *openFile, inode Ino, ss []*slice) bool {
+	if f == nil || len(ss) == 0 || ss[0].len < keepMinLen {
+		return false
+	}
+	p := f.profile.Load()
+	if p == profileUnknown {
+		var v []byte
+		p = profileOther
+		if m.en.GetXattr(Background(), inode, ProfileXattr, &v) == 0 && string(v) == ProfileVMDisk {
+			p = profileVMDisk
+		}
+		f.profile.CompareAndSwap(profileUnknown, p)
+	}
+	return p == profileVMDisk
+}
+
+// forgetProfile makes the next read of an open file look up its profile again.
+func (m *baseMeta) forgetProfile(inode Ino, name string) {
+	if name != ProfileXattr {
+		return
+	}
+	if f := m.of.find(inode); f != nil {
+		f.profile.Store(profileUnknown)
 	}
 }
 

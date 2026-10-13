@@ -186,6 +186,7 @@ func testMeta(t *testing.T, m Meta) {
 	testCompaction(t, m, true)
 	testWriteMulti(t, m)
 	testCompactKeepShared(t, m)
+	testKeepReadTrigger(t, m)
 	testCopyFileRange(t, m)
 	testCloseSession(t, m)
 	testConcurrentDir(t, m)
@@ -2389,6 +2390,87 @@ func testCompactKeepShared(t *testing.T, m Meta) {
 	}
 	waitDeleted(second)
 	waitDeleted(base)
+}
+
+// testKeepReadTrigger checks that reading an open VM disk compacts a chunk only
+// once it has keepReadTrigger runs, while other files still compact at 5.
+func testKeepReadTrigger(t *testing.T, m Meta) {
+	_ = m.Init(testFormat(), false)
+	if err := m.NewSession(false); err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	defer m.CloseSession()
+	m.OnMsg(DeleteSlice, func(args ...interface{}) error { return nil })
+	m.OnMsg(CompactChunk, func(args ...interface{}) error { return nil })
+	ctx := Background()
+	runs := func(inode Ino) int {
+		ss, st := m.getBase().en.doRead(ctx, inode, 0)
+		if st != 0 {
+			t.Fatalf("read chunk: %s", st)
+		}
+		return sliceRuns(ss)
+	}
+	// readUntil reads the chunk, which may start a compaction, and waits up to
+	// a second for its run count to satisfy ok.
+	readUntil := func(inode Ino, ok func(int) bool) int {
+		var cs []Slice
+		if st := m.Read(ctx, inode, 0, &cs); st != 0 {
+			t.Fatalf("read: %s", st)
+		}
+		n := runs(inode)
+		for i := 0; i < 20 && !ok(n); i++ {
+			time.Sleep(50 * time.Millisecond)
+			n = runs(inode)
+		}
+		return n
+	}
+	open := func(name string, vmDisk bool, writes int) Ino {
+		var inode Ino
+		attr := &Attr{}
+		_ = m.Unlink(ctx, 1, name)
+		if st := m.Create(ctx, 1, name, 0644, 022, 0, &inode, attr); st != 0 {
+			t.Fatalf("create %s: %s", name, st)
+		}
+		var id uint64
+		m.NewSlice(ctx, &id)
+		_ = m.Write(ctx, inode, 0, 0, Slice{Id: id, Size: ChunkSize, Len: ChunkSize}, time.Now())
+		if vmDisk {
+			if st := m.SetXattr(ctx, inode, ProfileXattr, []byte(ProfileVMDisk), 0); st != 0 {
+				t.Fatalf("setxattr: %s", st)
+			}
+		}
+		for i := 0; i < writes; i++ {
+			m.NewSlice(ctx, &id)
+			_ = m.Write(ctx, inode, 0, uint32(i)<<20, Slice{Id: id, Size: 8192, Len: 8192}, time.Now())
+		}
+		return inode
+	}
+
+	plain := open("plain-read", false, 5)
+	if n := readUntil(plain, func(n int) bool { return n < 6 }); n >= 6 {
+		t.Fatalf("reading a file with 6 runs did not compact it")
+	}
+
+	disk := open("vmdisk-read", true, 10)
+	if n := readUntil(disk, func(n int) bool { return n != 11 }); n != 11 {
+		t.Fatalf("reading a VM disk with 11 runs compacted it to %d runs", n)
+	}
+	var id uint64
+	for i := 10; i < keepReadTrigger-1; i++ {
+		m.NewSlice(ctx, &id)
+		_ = m.Write(ctx, disk, 0, uint32(i)<<20, Slice{Id: id, Size: 8192, Len: 8192}, time.Now())
+	}
+	if n := readUntil(disk, func(n int) bool { return n != keepReadTrigger }); n == keepReadTrigger {
+		t.Fatalf("reading a VM disk with %d runs did not compact it", keepReadTrigger)
+	}
+
+	for _, name := range []string{"plain-read", "vmdisk-read"} {
+		var inode Ino
+		if st := m.Lookup(ctx, 1, name, &inode, &Attr{}, false); st == 0 {
+			m.Close(ctx, inode)
+		}
+		_ = m.Unlink(ctx, 1, name)
+	}
 }
 
 func testCloseSession(t *testing.T, m Meta) {

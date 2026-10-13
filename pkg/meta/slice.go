@@ -218,6 +218,18 @@ const (
 	keepMinLen     = 1 << 20   // the oldest slice is kept only if at least this long
 	keepMergeGap   = 128 << 10 // changed ranges closer than this are rewritten as one
 	keepMaxExtents = 256       // more changed ranges than this fall back to a full compaction
+
+	// keepReadTrigger is how many runs (see sliceRuns) a VM disk's chunk needs
+	// before a read compacts it. Each such compaction copies every range changed
+	// since the kept slice, so compacting after a few writes, as other files do,
+	// copies the same data over and over.
+	keepReadTrigger = 64
+)
+
+const (
+	profileUnknown int32 = iota
+	profileOther
+	profileVMDisk
 )
 
 // keepPlan rewrites only the changed ranges of a chunk into one new slice, which
@@ -292,6 +304,12 @@ func clipSegments(segs []Slice, extents [][2]uint32) []Slice {
 		pos += s.Len
 	}
 	return out
+}
+
+// compactOnRead reports whether reading a chunk with these entries should
+// compact it, for a file that is not a VM disk.
+func compactOnRead(runs, entries, visible int) bool {
+	return runs >= 5 || runs == entries && visible >= 5
 }
 
 // sliceRuns counts the entries of ss, counting consecutive entries of one slice
