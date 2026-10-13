@@ -142,7 +142,10 @@ type engine interface {
 	writeMultiEngine // doWriteMulti and writeMultiLimits (writemulti.go)
 	doTruncate(ctx Context, inode Ino, flags uint8, length uint64, delta *dirStat, attr *Attr, skipPermCheck bool) syscall.Errno
 	doFallocate(ctx Context, inode Ino, mode uint8, off uint64, size uint64, delta *dirStat, attr *Attr) syscall.Errno
-	doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno
+	// doCompactChunk replaces the entries in origin after the first skipped with
+	// entries, which reference the new slice id refs times.
+	doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, entries []byte, id uint64, size uint32, refs int, delayed []byte) syscall.Errno
+	GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) syscall.Errno
 
 	doGetParents(ctx Context, inode Ino) map[Ino]int
 	doUpdateDirStat(ctx Context, batch map[Ino]dirStat) error
@@ -2137,7 +2140,10 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 
 	*slices = buildSlice(ss)
 	m.of.CacheChunk(inode, indx, *slices)
-	if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
+	// A chunk compacted by planKeepCompaction has many entries of one slice, and
+	// as many visible pieces; count it by runs so reading it doesn't compact again.
+	runs := sliceRuns(ss)
+	if !m.conf.ReadOnly && (runs >= 5 || runs == len(ss) && len(*slices) >= 5) {
 		tierID := -1
 		if f != nil {
 			tierID = int(f.attr.Tier)
@@ -2857,20 +2863,37 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 	if len(ss) > maxCompactSlices {
 		ss = ss[:maxCompactSlices]
 	}
-	skipped := skipSome(ss)
-	compacted := ss[skipped:]
-	pos, size, slices := compactChunk(compacted)
-	if len(compacted) < 2 || size == 0 {
-		return
-	}
-	for _, s := range ss[:skipped] {
-		if pos+size > s.pos && s.pos+s.len > pos {
-			var sstring string
-			for _, s := range ss {
-				sstring += fmt.Sprintf("\n%+v", *s)
-			}
-			panic(fmt.Sprintf("invalid compaction skipped %d, pos %d, size %d; slices: %s", skipped, pos, size, sstring))
+	var skipped int
+	var compacted []*slice
+	var pos, size uint32
+	var slices []Slice
+	var extents [][2]uint32
+	if plan, ok := m.planKeepShared(inode, ss); ok {
+		if len(plan.extents) == 0 {
+			return
 		}
+		skipped, compacted, slices, extents = 1, ss[1:], plan.data, plan.extents
+		pos = extents[0][0]
+		for _, e := range extents {
+			size += e[1]
+		}
+	} else {
+		skipped = skipSome(ss)
+		compacted = ss[skipped:]
+		pos, size, slices = compactChunk(compacted)
+		if len(compacted) < 2 || size == 0 {
+			return
+		}
+		for _, s := range ss[:skipped] {
+			if pos+size > s.pos && s.pos+s.len > pos {
+				var sstring string
+				for _, s := range ss {
+					sstring += fmt.Sprintf("\n%+v", *s)
+				}
+				panic(fmt.Sprintf("invalid compaction skipped %d, pos %d, size %d; slices: %s", skipped, pos, size, sstring))
+			}
+		}
+		extents = [][2]uint32{{pos, size}}
 	}
 
 	var id uint64
@@ -2907,7 +2930,13 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 	for _, s := range ss {
 		origin = append(origin, marshalSlice(s.pos, s.id, s.size, s.off, s.len)...)
 	}
-	st = m.en.doCompactChunk(inode, indx, origin, compacted, skipped, pos, id, size, dsbuf)
+	entries := make([]byte, 0, len(extents)*sliceBytes)
+	var off uint32
+	for _, e := range extents {
+		entries = append(entries, marshalSlice(e[0], id, size, off, e[1])...)
+		off += e[1]
+	}
+	st = m.en.doCompactChunk(inode, indx, origin, compacted, skipped, pos, entries, id, size, len(extents), dsbuf)
 	if st == syscall.EINVAL {
 		logger.Infof("compaction for %d:%d is wasted, delete slice %d (%d bytes)", inode, indx, id, size)
 		m.deleteSlice(id, size)
@@ -2924,6 +2953,18 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 		m.Unlock()
 		m.compactChunk(inode, indx, once, force, tierID)
 	}
+}
+
+// planKeepShared plans a compaction that keeps ss[0] shared, if the file is a VM disk.
+func (m *baseMeta) planKeepShared(inode Ino, ss []*slice) (keepPlan, bool) {
+	if len(ss) == 0 || ss[0].len < keepMinLen {
+		return keepPlan{}, false
+	}
+	var v []byte
+	if m.en.GetXattr(Background(), inode, ProfileXattr, &v) != 0 || string(v) != ProfileVMDisk {
+		return keepPlan{}, false
+	}
+	return planKeepCompaction(ss)
 }
 
 func (m *baseMeta) Compact(ctx Context, inode Ino, concurrency int, preFunc, postFunc func()) syscall.Errno {

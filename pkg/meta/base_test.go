@@ -185,6 +185,7 @@ func testMeta(t *testing.T, m Meta) {
 	time.Sleep(time.Second)
 	testCompaction(t, m, true)
 	testWriteMulti(t, m)
+	testCompactKeepShared(t, m)
 	testCopyFileRange(t, m)
 	testCloseSession(t, m)
 	testConcurrentDir(t, m)
@@ -2255,6 +2256,139 @@ func testCopyFileRange(t *testing.T, m Meta) {
 			}
 		}
 	}
+}
+
+// testCompactKeepShared compacts a VM disk image that shares a base slice with
+// a clone, and checks the base stays shared and every slice is freed exactly
+// when its last reference goes.
+func testCompactKeepShared(t *testing.T, m Meta) {
+	_ = m.Init(testFormat(), false)
+	if err := m.NewSession(false); err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	defer m.CloseSession()
+	var l sync.Mutex
+	deleted := make(map[uint64]int)
+	m.OnMsg(DeleteSlice, func(args ...interface{}) error {
+		l.Lock()
+		deleted[args[0].(uint64)]++
+		l.Unlock()
+		return nil
+	})
+	m.OnMsg(CompactChunk, func(args ...interface{}) error { return nil })
+	deletedTimes := func(id uint64) int {
+		l.Lock()
+		defer l.Unlock()
+		return deleted[id]
+	}
+	waitDeleted := func(id uint64) {
+		t.Helper()
+		for i := 0; i < 100 && deletedTimes(id) == 0; i++ {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if n := deletedTimes(id); n != 1 {
+			t.Fatalf("slice %d deleted %d times, want 1", id, n)
+		}
+	}
+	ctx := Background()
+	compact := func(inode Ino) {
+		if c, ok := m.(compactor); ok {
+			c.compactChunk(inode, 0, false, true, 0)
+		}
+	}
+	entries := func(inode Ino) []*slice {
+		ss, st := m.getBase().en.doRead(ctx, inode, 0)
+		if st != 0 {
+			t.Fatalf("read chunk: %s", st)
+		}
+		return ss
+	}
+	write := func(inode Ino, pos uint32, n uint32) uint64 {
+		var id uint64
+		m.NewSlice(ctx, &id)
+		if st := m.Write(ctx, inode, 0, pos, Slice{Id: id, Size: n, Len: n}, time.Now()); st != 0 {
+			t.Fatalf("write: %s", st)
+		}
+		return id
+	}
+
+	var inode Ino
+	attr := &Attr{}
+	_ = m.Unlink(ctx, 1, "vmdisk")
+	_ = m.Unlink(ctx, 1, "vmdisk-clone")
+	if st := m.Create(ctx, 1, "vmdisk", 0644, 022, 0, &inode, attr); st != 0 {
+		t.Fatalf("create: %s", st)
+	}
+	m.Close(ctx, inode) // so unlinking it frees its data at once
+	base := write(inode, 0, ChunkSize)
+	if st := m.SetXattr(ctx, inode, ProfileXattr, []byte(ProfileVMDisk), 0); st != 0 {
+		t.Fatalf("setxattr: %s", st)
+	}
+	var small []uint64
+	for _, pos := range []uint32{1 << 20, 20 << 20, 30 << 20, 40 << 20, 50 << 20} {
+		small = append(small, write(inode, pos, 8192))
+	}
+	compact(inode)
+	ss := entries(inode)
+	if len(ss) != 6 || ss[0].id != base || ss[0].len != ChunkSize {
+		t.Fatalf("want the base followed by 5 ranges of one new slice, got %d entries, first %+v", len(ss), *ss[0])
+	}
+	first := ss[1].id
+	for _, s := range ss[1:] {
+		if s.id != first || s.len != 8192 {
+			t.Fatalf("unexpected entry %+v", *s)
+		}
+	}
+	for _, id := range small {
+		waitDeleted(id)
+	}
+	compact(inode) // nothing new: a no-op, which also ends the forced recursion
+	if again := entries(inode); len(again) != 6 || again[1].id != first {
+		t.Fatalf("compacted again: %d entries", len(again))
+	}
+
+	// The clone references both the base and the compacted slice.
+	var count, total uint64
+	if st := m.Clone(ctx, 1, inode, 1, "vmdisk-clone", 0, 022, 1, &count, &total); st != 0 {
+		t.Fatalf("clone: %s", st)
+	}
+	var clone Ino
+	if st := m.Lookup(ctx, 1, "vmdisk-clone", &clone, attr, false); st != 0 {
+		t.Fatalf("lookup clone: %s", st)
+	}
+
+	// Write the original again and compact: its old ranges move to a new slice,
+	// but the clone still needs the first compacted slice and the base.
+	write(inode, 10<<20, 8192)
+	write(inode, 60<<20, 8192)
+	compact(inode)
+	ss = entries(inode)
+	if len(ss) != 8 || ss[0].id != base || ss[1].id == first {
+		t.Fatalf("second compaction: got %d entries, %+v %+v", len(ss), *ss[0], *ss[1])
+	}
+	second := ss[1].id
+	time.Sleep(200 * time.Millisecond)
+	if deletedTimes(first) != 0 || deletedTimes(base) != 0 {
+		t.Fatalf("deleted a slice the clone still references")
+	}
+
+	// The clone's own reads still see the first compaction.
+	if cs := entries(clone); len(cs) != 6 || cs[1].id != first {
+		t.Fatalf("clone changed: %d entries", len(cs))
+	}
+
+	if st := m.Unlink(ctx, 1, "vmdisk-clone"); st != 0 {
+		t.Fatalf("unlink clone: %s", st)
+	}
+	waitDeleted(first)
+	if deletedTimes(base) != 0 {
+		t.Fatalf("deleted the base while the original references it")
+	}
+	if st := m.Unlink(ctx, 1, "vmdisk"); st != 0 {
+		t.Fatalf("unlink: %s", st)
+	}
+	waitDeleted(second)
+	waitDeleted(base)
 }
 
 func testCloseSession(t *testing.T, m Meta) {

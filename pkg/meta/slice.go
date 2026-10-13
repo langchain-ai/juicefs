@@ -208,3 +208,100 @@ OUT:
 	}
 	return skipped
 }
+
+// A file whose ProfileXattr is ProfileVMDisk is compacted with
+// planKeepCompaction, so a clone keeps sharing the data it has not overwritten.
+const (
+	ProfileXattr  = "user.juicefs.profile"
+	ProfileVMDisk = "vm-disk"
+
+	keepMinLen     = 1 << 20   // the oldest slice is kept only if at least this long
+	keepMergeGap   = 128 << 10 // changed ranges closer than this are rewritten as one
+	keepMaxExtents = 256       // more changed ranges than this fall back to a full compaction
+)
+
+// keepPlan rewrites only the changed ranges of a chunk into one new slice, which
+// the chunk then references once per range on top of its oldest slice.
+type keepPlan struct {
+	data    []Slice     // what to copy into the new slice, in order
+	extents [][2]uint32 // position and length of each rewritten range
+}
+
+// planKeepCompaction plans a compaction of ss that leaves ss[0] in place and
+// rewrites the ranges later slices changed. ok is false when the chunk should be
+// compacted the usual way instead: ss[0] is too small to be worth keeping, or so
+// much has changed that keeping it would leave more pieces than data. An empty
+// plan with ok means there is nothing to do.
+func planKeepCompaction(ss []*slice) (plan keepPlan, ok bool) {
+	if len(ss) < 2 {
+		return plan, true
+	}
+	first := ss[0]
+	if first.id == 0 || first.len < keepMinLen {
+		return plan, false
+	}
+	// Already compacted this way, with nothing written since.
+	if len(ss) == 2 || sliceRuns(ss[1:]) == 1 {
+		return plan, true
+	}
+	segs := buildSlice(ss)
+	end := first.pos + first.len
+	var pos, dirty uint32
+	for _, s := range segs {
+		kept := s.Id == first.id && s.Size == first.size && pos >= first.pos && s.Off == first.off+(pos-first.pos)
+		// A hole over the kept range hides its data, so it has to be rewritten too.
+		if !kept && (s.Id != 0 || (pos < end && pos+s.Len > first.pos)) {
+			if n := len(plan.extents); n > 0 && pos-(plan.extents[n-1][0]+plan.extents[n-1][1]) < keepMergeGap {
+				plan.extents[n-1][1] = pos + s.Len - plan.extents[n-1][0]
+			} else {
+				plan.extents = append(plan.extents, [2]uint32{pos, s.Len})
+			}
+		}
+		pos += s.Len
+	}
+	for _, e := range plan.extents {
+		dirty += e[1]
+	}
+	if len(plan.extents) > keepMaxExtents || dirty > first.len/2 {
+		return keepPlan{}, false
+	}
+	plan.data = clipSegments(segs, plan.extents)
+	return plan, true
+}
+
+// clipSegments returns the parts of segs inside extents, in order.
+func clipSegments(segs []Slice, extents [][2]uint32) []Slice {
+	var out []Slice
+	var pos uint32
+	i := 0
+	for _, s := range segs {
+		for i < len(extents) && extents[i][0]+extents[i][1] <= pos {
+			i++
+		}
+		for j := i; j < len(extents) && extents[j][0] < pos+s.Len; j++ {
+			start, stop := max(pos, extents[j][0]), min(pos+s.Len, extents[j][0]+extents[j][1])
+			if start >= stop {
+				continue
+			}
+			c := Slice{Id: s.Id, Size: s.Size, Off: s.Off + start - pos, Len: stop - start}
+			if s.Id == 0 {
+				c.Size, c.Off = c.Len, 0
+			}
+			out = append(out, c)
+		}
+		pos += s.Len
+	}
+	return out
+}
+
+// sliceRuns counts the entries of ss, counting consecutive entries of one slice
+// once: a chunk compacted by planKeepCompaction lists its new slice per range.
+func sliceRuns(ss []*slice) int {
+	var n int
+	for i, s := range ss {
+		if i == 0 || s.id == 0 || s.id != ss[i-1].id || s.size != ss[i-1].size {
+			n++
+		}
+	}
+	return n
+}
