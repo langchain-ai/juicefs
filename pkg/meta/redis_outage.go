@@ -92,3 +92,25 @@ func metaOutageBackoff(attempt int) time.Duration {
 	}
 	return 20 * time.Millisecond << attempt
 }
+
+// readThroughOutage reruns a read while the metadata engine is unreachable, for up
+// to metaOutageTolerance. A read has no side effects, so any connection error is
+// safe to retry. Block reads and attribute refreshes go through here: an error from
+// either reaches a guest disk as an I/O error, which ext4 answers by going
+// read-only.
+func readThroughOutage[T any](ctx Context, op string, read func() (T, error)) (T, error) {
+	start := time.Now()
+	for attempt := 0; ; attempt++ {
+		v, err := read()
+		if err == nil || !isRedisConnectionError(err) || time.Since(start) >= metaOutageTolerance || ctx.Canceled() {
+			if err == nil && attempt > 0 {
+				logger.Warnf("%s succeeded after the metadata engine was unreachable for %s (%d retries)", op, time.Since(start), attempt)
+			}
+			return v, err
+		}
+		if attempt == 0 {
+			logger.Warnf("Metadata engine unreachable during %s, retrying for up to %s: %s", op, metaOutageTolerance, err)
+		}
+		time.Sleep(metaOutageBackoff(attempt))
+	}
+}

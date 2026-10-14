@@ -1076,7 +1076,9 @@ func (m *redisMeta) Resolve(ctx Context, parent Ino, path string, inode *Ino, at
 }
 
 func (m *redisMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
-	a, err := m.rdb.Get(ctx, m.inodeKey(inode)).Bytes()
+	a, err := readThroughOutage(ctx, "doGetAttr", func() ([]byte, error) {
+		return m.rdb.Get(ctx, m.inodeKey(inode)).Bytes()
+	})
 	if err == nil {
 		m.parseAttr(a, attr)
 	}
@@ -3112,7 +3114,9 @@ func (m *redisMeta) doDeleteSustainedInode(sid uint64, inode Ino) error {
 }
 
 func (m *redisMeta) doRead(ctx Context, inode Ino, indx uint32) ([]*slice, syscall.Errno) {
-	vals, err := m.rdb.LRange(ctx, m.chunkKey(inode, indx), 0, -1).Result()
+	vals, err := readThroughOutage(ctx, "doRead", func() ([]string, error) {
+		return m.rdb.LRange(ctx, m.chunkKey(inode, indx), 0, -1).Result()
+	})
 	if err != nil {
 		return nil, errno(err)
 	}
