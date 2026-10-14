@@ -1171,7 +1171,9 @@ func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...strin
 		retryOnFailure = false
 		lastErr        error
 		method         txMethod
+		outageRetries  int
 	)
+	idempotent := ctx.Value(txIdempotentKey{}) != nil
 	maxRetry := 50
 	if val := ctx.Value(txMaxRetryKey{}); val != nil {
 		maxRetry = val.(int)
@@ -1188,6 +1190,23 @@ func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...strin
 			} else {
 				err = syscall.Errno(eno)
 			}
+		}
+		// Ride out a short outage: retry by time rather than by count, and only
+		// errors that cannot have applied the transaction, unless it is idempotent.
+		if err != nil && time.Since(start) < metaOutageTolerance &&
+			(isUnsentRedisError(err) || idempotent && isRedisConnectionError(err)) {
+			if outageRetries == 0 {
+				logger.Warnf("Metadata engine unreachable during transaction %s, retrying for up to %s: %s", method.name(ctx), metaOutageTolerance, err)
+			}
+			m.txRestart.WithLabelValues(method.name(ctx)).Add(1)
+			lastErr = err
+			time.Sleep(metaOutageBackoff(outageRetries))
+			outageRetries++
+			i--
+			continue
+		}
+		if err == nil && outageRetries > 0 {
+			logger.Warnf("Transaction %s succeeded after the metadata engine was unreachable for %s (%d retries), last error: %s", method.name(ctx), time.Since(start), outageRetries, lastErr)
 		}
 		if err != nil && m.shouldRetry(err, retryOnFailure) {
 			m.txRestart.WithLabelValues(method.name(ctx)).Add(1)
@@ -3133,7 +3152,11 @@ func (m *redisMeta) doList(ctx Context, inode Ino) ([]*slice, syscall.Errno) {
 }
 
 func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
-	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+	encoded := marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len)
+	var sent bool
+	// Slice IDs are unique, so finding this record on a rerun means an earlier
+	// attempt's EXEC was applied even though its reply was lost.
+	return errno(m.txn(ctx.WithValue(txIdempotentKey{}, true), func(tx *redis.Tx) error {
 		*delta = dirStat{}
 		*attr = Attr{}
 		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
@@ -3143,6 +3166,18 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 		m.parseAttr(a, attr)
 		if attr.Typ != TypeFile {
 			return syscall.EPERM
+		}
+		if sent {
+			vals, err := tx.LRange(ctx, m.chunkKey(inode, indx), 0, -1).Result()
+			if err != nil {
+				return err
+			}
+			for _, v := range vals {
+				if v == string(encoded) {
+					*numSlices = len(vals)
+					return nil
+				}
+			}
 		}
 		newleng := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
 		if newleng > attr.Length {
@@ -3160,8 +3195,9 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 		attr.Ctimensec = uint32(now.Nanosecond())
 
 		var rpush *redis.IntCmd
+		sent = true
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			rpush = pipe.RPush(ctx, m.chunkKey(inode, indx), marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len))
+			rpush = pipe.RPush(ctx, m.chunkKey(inode, indx), encoded)
 			// most of chunk are used by single inode, so use that as the default (1 == not exists)
 			// pipe.Incr(ctx, r.sliceKey(slice.ID, slice.Size))
 			pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
