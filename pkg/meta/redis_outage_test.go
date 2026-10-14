@@ -338,3 +338,48 @@ func TestRedisOutageErrorClassification(t *testing.T) {
 		}
 	}
 }
+
+// A block read or attribute refresh issued while Redis refuses connections must
+// wait for it: an I/O error on a VM disk image sends the guest's ext4 read-only.
+func TestRedisReadsRideOutRefusedConnections(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		tolerance time.Duration
+		wantErr   bool
+	}{
+		{name: "tolerated", tolerance: 30 * time.Second},
+		{name: "disabled", tolerance: 0, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, proxy := newOutageTestMeta(t, tc.tolerance)
+			inode := newOutageTestFile(t, m)
+			if st := writeTestSlice(t, m, inode); st != 0 {
+				t.Fatalf("write: %s", st)
+			}
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				proxy.outage(3 * time.Second)
+			}()
+			time.Sleep(100 * time.Millisecond)
+			slices, readErr := m.doRead(Background(), inode, 0)
+			var attr Attr
+			attrErr := m.doGetAttr(Background(), inode, &attr)
+			<-done
+
+			if tc.wantErr {
+				if readErr == 0 && attrErr == 0 {
+					t.Fatalf("reads succeeded during the outage with retries disabled; the outage was not observed")
+				}
+				return
+			}
+			if readErr != 0 || attrErr != 0 {
+				t.Fatalf("read: %s, getattr: %s", readErr, attrErr)
+			}
+			if len(slices) != 1 || attr.Length != 4096 {
+				t.Fatalf("got %d slices and length %d, want 1 and 4096", len(slices), attr.Length)
+			}
+		})
+	}
+}
