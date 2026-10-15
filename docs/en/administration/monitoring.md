@@ -270,3 +270,78 @@ After successfully registering with Consul, you need to add a new [`consul_sd_co
 ## Monitoring metrics reference {#metrics-reference}
 
 Refer to [JuiceFS Metrics](../reference/p8s_metrics.md).
+
+## Diagnosing slow object storage requests
+
+The chunk client records local waits separately from object storage latency. The
+following metrics use the mount's existing registry and metric prefix (normally
+`juicefs_`). Their labels have fixed values; object keys, URLs, headers, and error
+messages are not added as labels.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `object_request_wait_seconds` | `method`, `reason` | Time waiting for an upload/download `slot` or a configured `bandwidth` limit. Observed after each wait finishes. |
+| `object_request_phase_seconds` | `method`, `phase` | Observed GCS SDK phase durations, summed across HTTP requests within one object operation. |
+| `object_request_connection_attempts_total` | `method` | HTTP connection acquisitions, including reused connections, retries, and resumable-upload protocol requests. This is not a retry count. |
+| `object_request_reused_connections_total` | `method` | Acquisitions that reused an existing HTTP connection. |
+| `object_request_retryable_errors_total` | `method`, `reason` | Errors classified as retryable by the GCS SDK's default classifier. A decision does not guarantee another attempt: cancellation, retry limits, and idempotency policy still apply. |
+
+`object_request_terminal_errors_total{method,reason}` separately counts terminal
+GCS operation errors, including errors for which the SDK makes no retry decision
+(such as an unconditional PUT failure).
+
+`method` is `GET` or `PUT`. Local wait metrics work with all storage backends;
+SDK diagnostics currently support GCS. Unsupported backends omit SDK metrics.
+The nonblocking writeback upload attempt does not produce a slot-wait sample.
+
+The GCS phases are:
+
+- `connection_wait`: requesting an HTTP connection through obtaining it, including
+  pool wait and, for new connections, connection setup.
+- `dns`, `tcp_connect`, `tls`: completed DNS, TCP dial, and TLS handshake callbacks.
+  Reused connections normally have none of these callbacks.
+- `request_write`: obtaining the connection through completing the request write.
+- `first_byte`: completing the request write through receiving the first response
+  byte. An early response may omit this phase.
+- `body_read`: cumulative time inside the GCS SDK reader's `Read` calls. A resumed
+  download can include new HTTP requests and retry delays inside these calls.
+
+Phases overlap: connection setup is included in `connection_wait`, parallel dials
+can overlap, and `body_read` can include reconnection. Do not add the phase totals
+or subtract them from request latency to infer retry backoff. The metrics do not
+measure exact SDK backoff, token acquisition, response-header completion, or the
+server's internal processing time. The outer JuiceFS upload retry backoff and
+compression are also outside these phase measurements.
+
+Error categories are limited to `http_408`, `http_429`, `http_500`,
+`http_502`, `http_503`, `http_504`, `http_5xx_other`, `http_4xx_other`, `canceled`, `deadline`, `connection`,
+`grpc_unavailable`, `grpc_resource_exhausted`, `grpc_internal`, and `other`.
+These are diagnostic categories, not a replacement for the SDK's retry policy.
+The SDK's unconditional resumable-upload path does not forward the object-level
+retry classifier to chunk retries. Such recovered PUT retries increase connection
+acquisitions but do not produce retryable-error categories; an empty category
+counter does not establish that no retries occurred.
+
+GCS slow-request warnings include a `diagnostics` JSON object with these phase
+totals, connection counts, retryable-error counts, and a terminal error category
+for that operation.
+
+`pending_phase_seconds` reports elapsed time since callbacks whose completion has
+not been observed. Failed phases stop at the SDK result boundary before backoff;
+these elapsed durations also enter histograms. Snapshots are safe while timeout callbacks continue;
+a GET snapshot at timeout omits later events. PUT diagnostics follow the existing
+PUT log boundary and are emitted when the storage call returns. Up to eight
+concurrent TCP dials are tracked; `untracked_dials` reports overflow. Phase timing
+is best effort: incomplete background dials, detected overlapping callbacks, or duplicate dial addresses omit
+the ambiguous completed and pending phase values, listed in `omitted_phases`.
+Missing callbacks and late events can leave gaps. The SDK classifier boundary is
+not available for unconditional resumable chunk retries, so incomplete phase
+values on that path can also include unobserved retry delay.
+
+Use the local-wait histogram to identify concurrency or configured bandwidth
+pressure. Use per-operation slow logs to distinguish repeated retryable errors,
+connection setup, response wait, and body reads. The existing
+`object_request_durations_histogram_seconds` keeps its timing boundaries: it
+excludes local slot and bandwidth waits. Compare client evidence with provider
+error counts and host network/CPU metrics over the same time window; phase
+measurements alone do not establish why a remote service was slow.

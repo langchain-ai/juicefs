@@ -310,9 +310,7 @@ func (s *wSlice) WriteAt(p []byte, off int64) (n int, err error) {
 }
 
 func (store *cachedStore) put(ctx context.Context, key string, p *Page) error {
-	if store.upLimit != nil {
-		store.upLimit.Wait(int64(len(p.Data)))
-	}
+	store.waitForBandwidth("PUT", store.upLimit, len(p.Data))
 	p.Acquire()
 	var (
 		reqID string
@@ -321,9 +319,10 @@ func (store *cachedStore) put(ctx context.Context, key string, p *Page) error {
 	return utils.WithTimeout(ctx, func(ctx context.Context) error {
 		defer p.Release()
 		st := time.Now()
-		err := store.storage.Put(ctx, key, bytes.NewReader(p.Data), object.WithRequestID(&reqID), object.WithStorageClass(&sc))
+		trace := &object.RequestTrace{}
+		err := store.storage.Put(ctx, key, bytes.NewReader(p.Data), object.WithRequestID(&reqID), object.WithStorageClass(&sc), object.WithRequestTrace(trace))
 		used := time.Since(st)
-		logRequest("PUT", key, "", reqID, err, used)
+		logRequest("PUT", key, "", reqID, err, used, store.observeRequestTrace("PUT", trace))
 		store.objectDataBytes.WithLabelValues("PUT", sc).Add(float64(len(p.Data)))
 		store.objectReqsHistogram.WithLabelValues("PUT", sc).Observe(used.Seconds())
 		if err != nil {
@@ -345,7 +344,7 @@ func (store *cachedStore) delete(key string) error {
 		strings.Contains(err.Error(), "No such file")) {
 		err = nil
 	}
-	logRequest("DELETE", key, "", reqID, err, used)
+	logRequest("DELETE", key, "", reqID, err, used, object.RequestTraceSnapshot{})
 	store.objectReqsHistogram.WithLabelValues("DELETE", "").Observe(used.Seconds())
 	if err != nil {
 		store.objectReqErrors.Add(1)
@@ -462,7 +461,7 @@ func (s *wSlice) upload(indx int) {
 				return
 			}
 		}
-		s.store.currentUpload <- struct{}{}
+		s.store.acquireSlot("PUT", s.store.currentUpload)
 		defer func() { <-s.store.currentUpload }()
 		s.errors <- s.store.upload(ctx, key, block, s)
 	}()
@@ -683,20 +682,30 @@ type cachedStore struct {
 	upLimit         *ratelimit.Bucket
 	downLimit       *ratelimit.Bucket
 
-	cacheHits           prometheus.Counter
-	cacheMiss           prometheus.Counter
-	cacheHitBytes       prometheus.Counter
-	cacheMissBytes      prometheus.Counter
-	cacheReadHist       prometheus.Histogram
-	objectReqsHistogram *prometheus.HistogramVec
-	objectReqErrors     prometheus.Counter
-	objectDataBytes     *prometheus.CounterVec
-	stageBlockDelay     prometheus.Counter
-	stageBlockErrors    prometheus.Counter
+	cacheHits                prometheus.Counter
+	cacheMiss                prometheus.Counter
+	cacheHitBytes            prometheus.Counter
+	cacheMissBytes           prometheus.Counter
+	cacheReadHist            prometheus.Histogram
+	objectReqsHistogram      *prometheus.HistogramVec
+	objectReqErrors          prometheus.Counter
+	objectDataBytes          *prometheus.CounterVec
+	stageBlockDelay          prometheus.Counter
+	stageBlockErrors         prometheus.Counter
+	objectWaitSeconds        *prometheus.HistogramVec
+	objectPhaseSeconds       *prometheus.HistogramVec
+	objectRetryableErrors    *prometheus.CounterVec
+	objectTerminalErrors     *prometheus.CounterVec
+	objectConnectionAttempts *prometheus.CounterVec
+	objectReusedConnections  *prometheus.CounterVec
 }
 
-func logRequest(typeStr, key, param, reqID string, err error, used time.Duration) {
+func logRequest(typeStr, key, param, reqID string, err error, used time.Duration, trace object.RequestTraceSnapshot) {
 	if used > SlowRequest {
+		if trace.Enabled {
+			logger.Warnf("slow request: %s %s %s(req_id: %q, err: %v, cost: %s, diagnostics: %s)", typeStr, key, param, reqID, err, used, trace)
+			return
+		}
 		logger.Warnf("slow request: %s %s %s(req_id: %q, err: %v, cost: %s)", typeStr, key, param, reqID, err, used)
 	} else {
 		logger.Debugf("%s %s %s(req_id: %q, err: %v, cost: %s)", typeStr, key, param, reqID, err, used)
@@ -725,22 +734,21 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 		}
 	}
 
-	store.currentDownload <- struct{}{}
+	store.acquireSlot("GET", store.currentDownload)
 	defer func() { <-store.currentDownload }()
-	if store.downLimit != nil {
-		store.downLimit.Wait(int64(len(p)))
-	}
+	store.waitForBandwidth("GET", store.downLimit, len(p))
 
 	start := time.Now()
 	var (
 		getMu sync.Mutex
 		got   = getResult{sc: object.DefaultStorageClass}
+		trace = &object.RequestTrace{}
 	)
 	page.Acquire()
 	err = utils.WithTimeout(ctx, func(cCtx context.Context) error {
 		defer page.Release()
 		res := getResult{sc: object.DefaultStorageClass}
-		in, err := store.storage.Get(cCtx, key, int64(off), int64(len(p)), object.WithRequestID(&res.reqID), object.WithStorageClass(&res.sc))
+		in, err := store.storage.Get(cCtx, key, int64(off), int64(len(p)), object.WithRequestID(&res.reqID), object.WithStorageClass(&res.sc), object.WithRequestTrace(trace))
 		if err == nil {
 			res.n, err = io.ReadFull(in, p)
 			_ = in.Close()
@@ -756,7 +764,7 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	n = res.n
 
 	used := time.Since(start)
-	logRequest("GET", key, fmt.Sprintf("RANGE(%d,%d) ", off, len(p)), res.reqID, err, used)
+	logRequest("GET", key, fmt.Sprintf("RANGE(%d,%d) ", off, len(p)), res.reqID, err, used, store.observeRequestTrace("GET", trace))
 	if errors.Is(err, context.Canceled) {
 		return 0, err
 	}
@@ -778,13 +786,13 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 			err = fmt.Errorf("recovered from %s", e)
 		}
 	}()
-	store.currentDownload <- struct{}{}
+	store.acquireSlot("GET", store.currentDownload)
 	defer func() { <-store.currentDownload }()
 	needed := store.compressor.CompressBound(len(page.Data))
 	compressed := needed > len(page.Data)
 	// we don't know the actual size for compressed block
 	if store.downLimit != nil && !compressed {
-		store.downLimit.Wait(int64(len(page.Data)))
+		store.waitForBandwidth("GET", store.downLimit, len(page.Data))
 	}
 	var (
 		p     *Page
@@ -800,13 +808,14 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 	var (
 		getMu sync.Mutex
 		got   = getResult{sc: object.DefaultStorageClass}
+		trace = &object.RequestTrace{}
 	)
 	p.Acquire()
 	err = utils.WithTimeout(ctx, func(cCtx context.Context) error {
 		defer p.Release()
 		res := getResult{sc: object.DefaultStorageClass}
 		// it will be retried in the upper layer.
-		in, err := store.storage.Get(cCtx, key, 0, -1, object.WithRequestID(&res.reqID), object.WithStorageClass(&res.sc))
+		in, err := store.storage.Get(cCtx, key, 0, -1, object.WithRequestID(&res.reqID), object.WithStorageClass(&res.sc), object.WithRequestTrace(trace))
 		if err == nil {
 			res.n, err = io.ReadFull(in, p.Data)
 			_ = in.Close()
@@ -828,9 +837,9 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 		return err
 	}
 	used := time.Since(start)
-	logRequest("GET", key, "", res.reqID, err, used)
+	logRequest("GET", key, "", res.reqID, err, used, store.observeRequestTrace("GET", trace))
 	if store.downLimit != nil && compressed {
-		store.downLimit.Wait(int64(n))
+		store.waitForBandwidth("GET", store.downLimit, n)
 	}
 	store.objectDataBytes.WithLabelValues("GET", res.sc).Add(float64(n))
 	store.objectReqsHistogram.WithLabelValues("GET", res.sc).Observe(used.Seconds())
@@ -957,6 +966,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 }
 
 func (store *cachedStore) initMetrics() {
+	store.initRequestDiagnostics()
 	store.cacheHits = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "blockcache_hits",
 		Help: "read from cached block",
@@ -1011,6 +1021,7 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.cacheMissBytes)
 	reg.MustRegister(store.cacheReadHist)
 	reg.MustRegister(store.objectReqsHistogram)
+	reg.MustRegister(store.objectWaitSeconds, store.objectPhaseSeconds, store.objectRetryableErrors, store.objectTerminalErrors, store.objectConnectionAttempts, store.objectReusedConnections)
 	reg.MustRegister(store.objectReqErrors)
 	reg.MustRegister(store.objectDataBytes)
 	reg.MustRegister(store.stageBlockDelay)
@@ -1054,7 +1065,7 @@ func parseObjOrigSize(key string) int {
 }
 
 func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
-	store.currentUpload <- struct{}{}
+	store.acquireSlot("PUT", store.currentUpload)
 	defer func() {
 		<-store.currentUpload
 	}()
