@@ -27,9 +27,11 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// defaultMetaOutageTolerance covers a Redis restart or failover of a few tens of
-// seconds. Past it, transactions fail as they did before and callers see EIO.
-const defaultMetaOutageTolerance = 60 * time.Second
+// defaultMetaOutageTolerance covers a Redis restart or failover of up to about two
+// minutes, AOF reload included. It stays within the 120 s after which Linux reports
+// tasks blocked on I/O as hung. Past it, calls fail as they did before and callers
+// see EIO.
+const defaultMetaOutageTolerance = 120 * time.Second
 
 // metaOutageTolerance bounds how long a Redis transaction keeps retrying while the
 // server is unreachable, so a short outage delays file operations instead of
