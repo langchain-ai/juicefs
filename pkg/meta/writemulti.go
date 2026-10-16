@@ -105,7 +105,7 @@ func (m *baseMeta) compactionAfterWrite(before, after int) (background, blocking
 func (m *baseMeta) compactAfterWrite(inode Ino, indx uint32, before, after, tier int) {
 	background, blocking := m.compactionAfterWrite(before, after)
 	if background {
-		go m.compactChunk(inode, indx, false, false, tier)
+		go m.compactChunk(inode, indx, false, false, tier, writeCompactTrigger(after))
 	} else if blocking {
 		m.compactBelowMaxSlices(inode, indx, after, tier)
 	}
@@ -120,7 +120,7 @@ func (m *baseMeta) compactAfterWrite(inode Ino, indx uint32, before, after, tier
 // as many slices.
 func (m *baseMeta) compactBelowMaxSlices(inode Ino, indx uint32, n, tier int) {
 	for n >= maxSlices {
-		m.compactChunk(inode, indx, true, false, tier)
+		m.compactChunk(inode, indx, true, false, tier, compactTriggerWriteSync)
 		ss, st := m.en.doRead(Background(), inode, indx)
 		if st != 0 {
 			logger.Warnf("Read chunk %d of inode %d after its compaction: %s", indx, inode, st)

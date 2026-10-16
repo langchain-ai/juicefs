@@ -72,6 +72,27 @@ func (m *baseMeta) shouldStartWriteCompaction(numSlices int) bool {
 	return numSlices%m.writeCompactionInterval == m.writeCompactionInterval-1 || numSlices > writeCompactionDebtThreshold
 }
 
+// What started a compaction of a chunk: the trigger label of compactions_total and compacted_bytes_total.
+const (
+	compactTriggerWriteInterval = "write_interval" // a write brought the chunk to the write-compaction interval
+	compactTriggerWriteBacklog  = "write_backlog"  // a write left more than writeCompactionDebtThreshold slices
+	compactTriggerWriteSync     = "write_sync"     // a write reached maxSlices; it waits for the compaction
+	compactTriggerRead          = "read"           // a read found 5 or more slices
+	compactTriggerCompact       = "compact"        // Compact (juicefs compact)
+	compactTriggerGC            = "gc"             // CompactAll (juicefs gc --compact)
+)
+
+var compactTriggers = []string{compactTriggerWriteInterval, compactTriggerWriteBacklog, compactTriggerWriteSync,
+	compactTriggerRead, compactTriggerCompact, compactTriggerGC}
+
+// writeCompactTrigger is the trigger of the background compaction started by a write that leaves numSlices in a chunk.
+func writeCompactTrigger(numSlices int) string {
+	if numSlices > writeCompactionDebtThreshold {
+		return compactTriggerWriteBacklog
+	}
+	return compactTriggerWriteInterval
+}
+
 func checkInodeName(name string) syscall.Errno {
 	if len(name) == 0 || strings.ContainsAny(name, "/\x00") {
 		return syscall.EINVAL
@@ -342,6 +363,8 @@ type baseMeta struct {
 	opDist       prometheus.Histogram
 	opCount      *prometheus.CounterVec
 	opDuration   *prometheus.CounterVec
+	compactCount *prometheus.CounterVec
+	compactBytes *prometheus.CounterVec
 
 	// Subdir info metric
 	subdirInfoG *prometheus.GaugeVec
@@ -441,6 +464,14 @@ func newBaseMeta(addr string, conf *Config) *baseMeta {
 			Name: "meta_ops_duration_seconds",
 			Help: "Meta operation duration in seconds.",
 		}, []string{"method"}),
+		compactCount: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "compactions_total",
+			Help: "Number of chunk compactions, by what triggered them.",
+		}, []string{"trigger"}),
+		compactBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "compacted_bytes_total",
+			Help: "Size of compacted data in bytes, by what triggered the compaction.",
+		}, []string{"trigger"}),
 
 		// Subdir info metric
 		subdirInfoG: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -627,6 +658,13 @@ func (m *baseMeta) InitMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(m.opDist)
 	reg.MustRegister(m.opCount)
 	reg.MustRegister(m.opDuration)
+	reg.MustRegister(m.compactCount)
+	reg.MustRegister(m.compactBytes)
+	for _, trigger := range compactTriggers {
+		// export every trigger from the start, so that rate() and increase() see its first compaction
+		m.compactCount.WithLabelValues(trigger)
+		m.compactBytes.WithLabelValues(trigger)
+	}
 }
 
 func (m *baseMeta) timeit(method string, start time.Time) {
@@ -2142,7 +2180,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 		if f != nil {
 			tierID = int(f.attr.Tier)
 		}
-		go m.compactChunk(inode, indx, false, false, tierID)
+		go m.compactChunk(inode, indx, false, false, tierID, compactTriggerRead)
 	}
 	return 0
 }
@@ -2195,9 +2233,9 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
 		if m.shouldStartWriteCompaction(numSlices) {
 			if numSlices < maxSlices {
-				go m.compactChunk(inode, indx, false, false, int(attr.Tier))
+				go m.compactChunk(inode, indx, false, false, int(attr.Tier), writeCompactTrigger(numSlices))
 			} else {
-				m.compactChunk(inode, indx, true, false, int(attr.Tier))
+				m.compactChunk(inode, indx, true, false, int(attr.Tier), compactTriggerWriteSync)
 			}
 		}
 	}
@@ -2800,7 +2838,7 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 		go func() {
 			for c := range ch {
 				logger.Debugf("Compacting chunk %d:%d (%d slices)", c.inode, c.indx, c.slices)
-				m.compactChunk(c.inode, c.indx, false, true, -1)
+				m.compactChunk(c.inode, c.indx, false, true, -1, compactTriggerGC)
 				bar.Increment()
 			}
 			wg.Done()
@@ -2817,7 +2855,7 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 	return 0
 }
 
-func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID int) {
+func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID int, trigger string) {
 	// avoid too many or duplicated compaction
 	k := uint64(inode) + (uint64(indx) << 40)
 	m.Lock()
@@ -2885,6 +2923,10 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 		}
 		tierID = int(attr.Tier)
 	}
+	// Counted as the chunk is handed to the CompactChunk handler, which observes compact_size_histogram_bytes
+	// for it (size is the sum of the slices' Len): once per compaction, whether it then succeeds or not.
+	m.compactCount.WithLabelValues(trigger).Inc()
+	m.compactBytes.WithLabelValues(trigger).Add(float64(size))
 	err := m.newMsg(CompactChunk, slices, id, uint8(tierID))
 	if err != nil {
 		if !strings.Contains(err.Error(), "not exist") && !strings.Contains(err.Error(), "not found") {
@@ -2922,7 +2964,7 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 		m.Lock()
 		delete(m.compacting, k)
 		m.Unlock()
-		m.compactChunk(inode, indx, once, force, tierID)
+		m.compactChunk(inode, indx, once, force, tierID, trigger)
 	}
 }
 
@@ -2940,7 +2982,7 @@ func (m *baseMeta) Compact(ctx Context, inode Ino, concurrency int, preFunc, pos
 		go func() {
 			defer wg.Done()
 			for c := range chunkChan {
-				m.compactChunk(c.inode, c.indx, false, true, int(attr.Tier))
+				m.compactChunk(c.inode, c.indx, false, true, int(attr.Tier), compactTriggerCompact)
 				postFunc()
 				if ctx.Canceled() {
 					return

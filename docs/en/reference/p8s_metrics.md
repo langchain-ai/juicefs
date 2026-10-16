@@ -107,9 +107,22 @@ If you haven't yet set up monitoring for JuiceFS, read [monitoring and data visu
 | Name                                   | Description                          | Unit |
 |----------------------------------------| -----------                          | ---- |
 | `juicefs_compact_size_histogram_bytes` | Size distributions of compacted data | byte |
+| `juicefs_compactions_total` | Number of chunk compactions, by what triggered them (label: `trigger`) | |
+| `juicefs_compacted_bytes_total` | Size of compacted data, by what triggered the compaction (label: `trigger`) | byte |
 | `juicefs_used_read_buffer_size_bytes`  | size of currently used buffer for read |      |
 | `juicefs_bgjob_duration_seconds` | Duration of background cleanup jobs (labels: `job`, `status`) | second |
 | `juicefs_bgjob_deletions_total` | Total number of deletions performed by background jobs (label: `job`) | |
+
+The `trigger` label of `juicefs_compactions_total` and `juicefs_compacted_bytes_total` tells what started a compaction:
+
+- `write_interval`: a write brought the number of slices of the chunk to the write-triggered compaction interval (`JFS_WRITE_COMPACTION_INTERVAL`, see [random writes](../introduction/io_processing.md#random-write))
+- `write_backlog`: a write left more than 350 slices in the chunk
+- `write_sync`: a write brought the chunk to 2500 slices or more; the write waits for the compaction
+- `read`: a read found 5 or more slices in the chunk
+- `compact`: [`juicefs compact`](command_reference.mdx#compact), which the mount point of the path runs
+- `gc`: [`juicefs gc --compact`](command_reference.mdx#gc), which runs in its own process, so its compactions are not in the metrics of mount points
+
+They count the compactions that `juicefs_compact_size_histogram_bytes` observes, whether they succeed or not, so apart from compactions about to start, their sums over `trigger` are its `_count` and `_sum`. A chunk with many slices can take several compactions, all counted under the same trigger. To see the effect of `JFS_WRITE_COMPACTION_INTERVAL`, compare the rates of both counters by `trigger` before and after changing it: a larger interval starts fewer `write_interval` compactions, and growing `write_backlog` or `write_sync` counts show chunks that reach the higher thresholds before they are compacted.
 
 ## Mount configuration {#mount-configuration}
 
