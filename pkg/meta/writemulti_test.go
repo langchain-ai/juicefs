@@ -1067,7 +1067,7 @@ func testWriteMultiRace(t *testing.T, m Meta, c compactor, rec *compactionRecord
 					return
 				default:
 				}
-				c.compactChunk(inode, indx, false, false, 0)
+				c.compactChunk(inode, indx, false, false, 0, compactTriggerRead)
 			}
 		}
 	}()
