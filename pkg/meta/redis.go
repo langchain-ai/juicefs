@@ -3830,7 +3830,7 @@ func (r *redisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error)
 	return count, err
 }
 
-func (m *redisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
+func (m *redisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, entries []byte, id uint64, size uint32, refs int, delayed []byte) syscall.Errno {
 	var rs []*redis.IntCmd // trash disabled: check reference of slices
 	if delayed == nil {
 		rs = make([]*redis.IntCmd, len(ss))
@@ -3854,11 +3854,13 @@ func (m *redisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*
 
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.LTrim(ctx, key, int64(n), -1)
-			pipe.LPush(ctx, key, marshalSlice(pos, id, size, 0, size))
+			for i := len(entries) / sliceBytes; i > 0; i-- {
+				pipe.LPush(ctx, key, entries[(i-1)*sliceBytes:i*sliceBytes])
+			}
 			for i := skipped; i > 0; i-- {
 				pipe.LPush(ctx, key, origin[(i-1)*sliceBytes:i*sliceBytes])
 			}
-			pipe.HSet(ctx, m.sliceRefs(), m.sliceKey(id, size), "0") // create the key to tracking it
+			pipe.HSet(ctx, m.sliceRefs(), m.sliceKey(id, size), refs-1) // create the key to tracking it
 			if delayed != nil {
 				if len(delayed) > 0 {
 					pipe.HSet(ctx, m.delSlices(), fmt.Sprintf("%d_%d", id, time.Now().Unix()), delayed)

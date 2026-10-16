@@ -3759,10 +3759,12 @@ func (m *dbMeta) deleteChunk(inode Ino, indx uint32) error {
 	if err != nil {
 		return fmt.Errorf("delete slice from chunk %s fail: %s, retry later", inode, err)
 	}
+	seen := make(map[uint64]bool) // a slice can appear in several entries
 	for _, s := range ss {
-		if s.id == 0 {
+		if s.id == 0 || seen[s.id] {
 			continue
 		}
+		seen[s.id] = true
 		var ref = sliceRef{Id: s.id}
 		err := m.simpleTxn(Background(), func(s *xorm.Session) error {
 			ok, err := s.Get(&ref)
@@ -3861,7 +3863,7 @@ func (m *dbMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 	return count, nil
 }
 
-func (m *dbMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
+func (m *dbMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, entries []byte, id uint64, size uint32, refs int, delayed []byte) syscall.Errno {
 	st := errno(m.txn(func(s *xorm.Session) error {
 		var c2 = chunk{Inode: inode, Indx: indx}
 		_, err := s.ForUpdate().MustCols("indx").Get(&c2)
@@ -3873,12 +3875,14 @@ func (m *dbMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*sli
 			return syscall.EINVAL
 		}
 
-		c2.Slices = append(append(c2.Slices[:skipped*sliceBytes], marshalSlice(pos, id, size, 0, size)...), c2.Slices[len(origin):]...)
+		// A fresh buffer: entries can be longer than the entries they replace.
+		c2.Slices = append(append(append(make([]byte, 0, len(c2.Slices)-len(origin)+skipped*sliceBytes+len(entries)),
+			c2.Slices[:skipped*sliceBytes]...), entries...), c2.Slices[len(origin):]...)
 		if _, err := s.Cols("slices").Where("Inode = ? AND indx = ?", inode, indx).Update(c2); err != nil {
 			return err
 		}
 		// create the key to tracking it
-		if err = mustInsert(s, sliceRef{id, size, 1}); err != nil {
+		if err = mustInsert(s, sliceRef{id, size, refs}); err != nil {
 			return err
 		}
 		if delayed != nil {
@@ -3922,10 +3926,12 @@ func (m *dbMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*sli
 			return mustInsert(s, &sliceRef{id, size, 0})
 		})
 	} else if st == 0 && delayed == nil {
+		seen := make(map[uint64]bool) // a slice can appear in several entries
 		for _, s := range ss {
-			if s.id == 0 {
+			if s.id == 0 || seen[s.id] {
 				continue
 			}
+			seen[s.id] = true
 			var ref = sliceRef{Id: s.id}
 			var ok bool
 			err := m.simpleTxn(Background(), func(s *xorm.Session) error {

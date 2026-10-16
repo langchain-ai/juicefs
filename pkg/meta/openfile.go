@@ -2,6 +2,7 @@ package meta
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,7 @@ type openFile struct {
 	lastCheck int64
 	first     []Slice
 	chunks    map[uint32][]Slice
+	profile   atomic.Int32 // the file's ProfileXattr: profileUnknown, profileOther or profileVMDisk
 }
 
 func (o *openFile) invalidateChunk() {
