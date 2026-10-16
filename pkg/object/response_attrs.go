@@ -23,6 +23,7 @@ type ResponseAttrs struct {
 	storageClass *string
 	requestID    *string
 	requestSize  *int64
+	requestTrace *RequestTrace
 	// other interested attrs can be added here
 }
 
@@ -48,6 +49,12 @@ func (r *ResponseAttrs) GetRequestSize() int64 {
 }
 
 type AttrGetter func(attrs *ResponseAttrs)
+
+// WithRequestTrace requests optional SDK diagnostics. Backends without tracing
+// support leave the collector disabled.
+func WithRequestTrace(trace *RequestTrace) AttrGetter {
+	return func(attrs *ResponseAttrs) { attrs.requestTrace = trace }
+}
 
 func WithRequestID(id *string) AttrGetter {
 	return func(attrs *ResponseAttrs) {
