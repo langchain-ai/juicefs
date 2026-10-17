@@ -153,6 +153,27 @@ juicefs format --storage s3 \
 
 上例中的 `/etc/certs` 只是一个目录，实际使用时请替换为你的证书目录，可以使用相对路径或绝对路径。
 
+#### Amazon ElastiCache IAM 认证
+
+使用 AWS IAM 角色连接 ElastiCache 时，在启用 TLS 的元数据 URL 中指定 `auth=aws-iam`：
+
+```shell
+juicefs mount 'rediss://my-iam-user@my-cache.example.cache.amazonaws.com:6379/0?auth=aws-iam&aws-region=us-east-1&aws-cache-name=my-replication-group' /mnt/jfs
+```
+
+该 URL 也可用于 `juicefs format` 等元数据命令。
+
+- `aws-cache-name`：复制组 ID 或 Serverless 缓存名称，不是 DNS 地址或 ARN。
+- `aws-region`：缓存所在的 AWS 区域。省略时使用 AWS SDK 的区域配置，例如 `AWS_REGION`。
+- `aws-serverless=true`：仅在使用 ElastiCache Serverless 时添加。
+- URL 中的用户名：启用 IAM 认证的 ElastiCache 用户，其用户 ID 和用户名必须一致。需将用户加入缓存的用户组，并授予 AWS 身份对缓存和用户资源的 `elasticache:Connect` 权限。Redis ACL 也必须允许 JuiceFS 的元数据操作。
+
+IAM 认证要求受支持的引擎版本（Redis OSS 7.0+ 或 Valkey 7.2+）、TLS 和服务器证书验证，不支持 Redis Sentinel。配置要求和 IAM 策略示例见 [AWS 文档](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/auth-iam.html)。
+
+JuiceFS 使用 AWS SDK 默认凭据链，包括 EC2 实例角色、ECS 任务角色和 EKS Web Identity。不要在 URL 中填写密码；IAM 模式下忽略 `REDIS_PASSWORD`、`META_PASSWORD` 和 `META_PASSWORD_FILE`。S3 存储认证需独立配置。
+
+每次建立 Redis 连接时生成新的 IAM 令牌，AWS SDK 按需刷新可续期的 AWS 凭据。令牌不会保存在元数据 URL 中。连接最长使用 11 小时，以避开 ElastiCache 的 12 小时 IAM 连接限制；如果配置了更短的 `conn_max_lifetime`，则保留该值。原有密码认证不受影响。使用此 URL 的客户端必须支持这些选项，无需迁移元数据格式。
+
 ### Valkey
 
 [Valkey](https://valkey.io) 是 Redis 的一个开源分支，旨在保留该项目由社区驱动的治理模式，同时保持与 Redis 生态系统的高度兼容。Valkey 专注于在中立的方式下维护稳定性、提升性能并持续创新，从而为依赖 Redis 兼容工作负载的用户确保长期可用性。

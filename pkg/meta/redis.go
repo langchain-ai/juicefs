@@ -125,6 +125,10 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	keyFile := query.pop("tls-key-file")
 	caCertFile := query.pop("tls-ca-cert-file")
 	tlsServerName := query.pop("tls-server-name")
+	auth := query.pop("auth")
+	awsRegion := query.pop("aws-region")
+	awsCache := query.pop("aws-cache-name")
+	awsServerless := query.pop("aws-serverless")
 
 	// Client-side caching options
 	clientCacheStr := query.pop("client-cache")
@@ -160,19 +164,31 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 			opt.TLSConfig.RootCAs = caCertPool
 		}
 	}
-	if opt.Password == "" {
-		opt.Password = os.Getenv("REDIS_PASSWORD")
-	}
-	if opt.Password == "" {
-		opt.Password = os.Getenv("META_PASSWORD")
-	}
-	if opt.Password == "" {
-		if passwordFile := os.Getenv("META_PASSWORD_FILE"); passwordFile != "" {
-			password, err := readPasswordFromFile(passwordFile)
-			if err != nil {
-				logger.Errorf("%v", err)
-			} else {
-				opt.Password = password
+	if auth == "aws-iam" {
+		if strings.Contains(hosts, ",") && strings.Index(hosts, ",") < strings.Index(hosts, ":") {
+			return nil, fmt.Errorf("AWS IAM authentication does not support Redis Sentinel")
+		}
+		if err := configureRedisIAM(context.Background(), opt, awsRegion, awsCache, awsServerless); err != nil {
+			return nil, err
+		}
+	} else {
+		if auth != "" || awsRegion != "" || awsCache != "" || awsServerless != "" {
+			return nil, fmt.Errorf("AWS IAM options require auth=aws-iam")
+		}
+		if opt.Password == "" {
+			opt.Password = os.Getenv("REDIS_PASSWORD")
+		}
+		if opt.Password == "" {
+			opt.Password = os.Getenv("META_PASSWORD")
+		}
+		if opt.Password == "" {
+			if passwordFile := os.Getenv("META_PASSWORD_FILE"); passwordFile != "" {
+				password, err := readPasswordFromFile(passwordFile)
+				if err != nil {
+					logger.Errorf("%v", err)
+				} else {
+					opt.Password = password
+				}
 			}
 		}
 	}
@@ -246,6 +262,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 			copt.MaxRedirects = 1
 			copt.Username = opt.Username
 			copt.Password = opt.Password
+			copt.CredentialsProviderContext = opt.CredentialsProviderContext
 			copt.TLSConfig = opt.TLSConfig
 			copt.MaxRetries = opt.MaxRetries
 			copt.MinRetryBackoff = opt.MinRetryBackoff

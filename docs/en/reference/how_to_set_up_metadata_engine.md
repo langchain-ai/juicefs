@@ -166,6 +166,27 @@ When specifying options in a URL, start with the `?` symbol and use the `&` symb
 
 In the above example, `/etc/certs` is just a directory name. Replace it with your actual certificate directory when using it, which can be a relative or absolute path.
 
+#### Amazon ElastiCache IAM authentication
+
+To authenticate to ElastiCache with an AWS IAM role, use `auth=aws-iam` and a TLS metadata URL:
+
+```shell
+juicefs mount 'rediss://my-iam-user@my-cache.example.cache.amazonaws.com:6379/0?auth=aws-iam&aws-region=us-east-1&aws-cache-name=my-replication-group' /mnt/jfs
+```
+
+The same URL can be used with `juicefs format` and other metadata commands. Configure:
+
+- `aws-cache-name`: the replication group ID, or the serverless cache name, **not** its DNS endpoint or ARN.
+- `aws-region`: the cache's AWS region. If omitted, JuiceFS uses the AWS SDK's region configuration, such as `AWS_REGION`.
+- `aws-serverless=true`: add this option for an ElastiCache Serverless cache; omit it for a replication group.
+- The URL username: an IAM-enabled ElastiCache user's ID and username (these must match). Associate the user with the cache's user group and grant the AWS identity `elasticache:Connect` on both the cache and user resources. Redis ACL permissions must also allow JuiceFS metadata operations.
+
+IAM authentication requires a supported ElastiCache engine version (Redis OSS 7.0+ or Valkey 7.2+), TLS, and certificate verification. Redis Sentinel is not supported with this authentication mode. See [AWS's IAM authentication guide](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/auth-iam.html) for service requirements and IAM policy examples.
+
+JuiceFS uses the AWS SDK's default credential chain, including EC2 instance roles, ECS task roles, and EKS web identity. Do not put a password in the URL. In IAM mode, `REDIS_PASSWORD`, `META_PASSWORD`, and `META_PASSWORD_FILE` are ignored. S3 storage authentication is configured separately.
+
+A fresh IAM token is signed for each new Redis connection; the AWS SDK refreshes renewable AWS credentials as needed. Tokens are not saved in the metadata URL. Connection lifetimes are capped at 11 hours to retire connections before ElastiCache's 12-hour IAM connection limit; a shorter `conn_max_lifetime` is preserved. Existing password-based connections are unchanged. Clients using this URL must run a JuiceFS version that supports these options; no metadata-format migration is required.
+
 ### Valkey
 
 [Valkey](https://valkey.io) is an open-source fork of Redis, created to preserve the project's community-driven governance while remaining highly compatible with the Redis ecosystem. Valkey focuses on maintaining stability, improving performance, and continuing innovation under a neutral approach, ensuring long-term availability for users who rely on Redis-compatible workloads.
