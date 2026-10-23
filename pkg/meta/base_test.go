@@ -185,6 +185,8 @@ func testMeta(t *testing.T, m Meta) {
 	time.Sleep(time.Second)
 	testCompaction(t, m, true)
 	testWriteMulti(t, m)
+	testCompactKeepShared(t, m)
+	testKeepReadTrigger(t, m)
 	testCopyFileRange(t, m)
 	testCloseSession(t, m)
 	testConcurrentDir(t, m)
@@ -2254,6 +2256,220 @@ func testCopyFileRange(t *testing.T, m Meta) {
 				t.Fatalf("expect slice %d,%d: %+v, but got %+v", i, j, expectedSlices[i][j], s)
 			}
 		}
+	}
+}
+
+// testCompactKeepShared compacts a VM disk image that shares a base slice with
+// a clone, and checks the base stays shared and every slice is freed exactly
+// when its last reference goes.
+func testCompactKeepShared(t *testing.T, m Meta) {
+	_ = m.Init(testFormat(), false)
+	if err := m.NewSession(false); err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	defer m.CloseSession()
+	var l sync.Mutex
+	deleted := make(map[uint64]int)
+	m.OnMsg(DeleteSlice, func(args ...interface{}) error {
+		l.Lock()
+		deleted[args[0].(uint64)]++
+		l.Unlock()
+		return nil
+	})
+	m.OnMsg(CompactChunk, func(args ...interface{}) error { return nil })
+	deletedTimes := func(id uint64) int {
+		l.Lock()
+		defer l.Unlock()
+		return deleted[id]
+	}
+	waitDeleted := func(id uint64) {
+		t.Helper()
+		for i := 0; i < 100 && deletedTimes(id) == 0; i++ {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if n := deletedTimes(id); n != 1 {
+			t.Fatalf("slice %d deleted %d times, want 1", id, n)
+		}
+	}
+	ctx := Background()
+	compact := func(inode Ino) {
+		if c, ok := m.(compactor); ok {
+			c.compactChunk(inode, 0, false, true, 0)
+		}
+	}
+	entries := func(inode Ino) []*slice {
+		ss, st := m.getBase().en.doRead(ctx, inode, 0)
+		if st != 0 {
+			t.Fatalf("read chunk: %s", st)
+		}
+		return ss
+	}
+	write := func(inode Ino, pos uint32, n uint32) uint64 {
+		var id uint64
+		m.NewSlice(ctx, &id)
+		if st := m.Write(ctx, inode, 0, pos, Slice{Id: id, Size: n, Len: n}, time.Now()); st != 0 {
+			t.Fatalf("write: %s", st)
+		}
+		return id
+	}
+
+	var inode Ino
+	attr := &Attr{}
+	_ = m.Unlink(ctx, 1, "vmdisk")
+	_ = m.Unlink(ctx, 1, "vmdisk-clone")
+	if st := m.Create(ctx, 1, "vmdisk", 0644, 022, 0, &inode, attr); st != 0 {
+		t.Fatalf("create: %s", st)
+	}
+	m.Close(ctx, inode) // so unlinking it frees its data at once
+	base := write(inode, 0, ChunkSize)
+	if st := m.SetXattr(ctx, inode, ProfileXattr, []byte(ProfileVMDisk), 0); st != 0 {
+		t.Fatalf("setxattr: %s", st)
+	}
+	var small []uint64
+	for _, pos := range []uint32{1 << 20, 20 << 20, 30 << 20, 40 << 20, 50 << 20} {
+		small = append(small, write(inode, pos, 8192))
+	}
+	compact(inode)
+	ss := entries(inode)
+	if len(ss) != 6 || ss[0].id != base || ss[0].len != ChunkSize {
+		t.Fatalf("want the base followed by 5 ranges of one new slice, got %d entries, first %+v", len(ss), *ss[0])
+	}
+	first := ss[1].id
+	for _, s := range ss[1:] {
+		if s.id != first || s.len != 8192 {
+			t.Fatalf("unexpected entry %+v", *s)
+		}
+	}
+	for _, id := range small {
+		waitDeleted(id)
+	}
+	compact(inode) // nothing new: a no-op, which also ends the forced recursion
+	if again := entries(inode); len(again) != 6 || again[1].id != first {
+		t.Fatalf("compacted again: %d entries", len(again))
+	}
+
+	// The clone references both the base and the compacted slice.
+	var count, total uint64
+	if st := m.Clone(ctx, 1, inode, 1, "vmdisk-clone", 0, 022, 1, &count, &total); st != 0 {
+		t.Fatalf("clone: %s", st)
+	}
+	var clone Ino
+	if st := m.Lookup(ctx, 1, "vmdisk-clone", &clone, attr, false); st != 0 {
+		t.Fatalf("lookup clone: %s", st)
+	}
+
+	// Write the original again and compact: its old ranges move to a new slice,
+	// but the clone still needs the first compacted slice and the base.
+	write(inode, 10<<20, 8192)
+	write(inode, 60<<20, 8192)
+	compact(inode)
+	ss = entries(inode)
+	if len(ss) != 8 || ss[0].id != base || ss[1].id == first {
+		t.Fatalf("second compaction: got %d entries, %+v %+v", len(ss), *ss[0], *ss[1])
+	}
+	second := ss[1].id
+	time.Sleep(200 * time.Millisecond)
+	if deletedTimes(first) != 0 || deletedTimes(base) != 0 {
+		t.Fatalf("deleted a slice the clone still references")
+	}
+
+	// The clone's own reads still see the first compaction.
+	if cs := entries(clone); len(cs) != 6 || cs[1].id != first {
+		t.Fatalf("clone changed: %d entries", len(cs))
+	}
+
+	if st := m.Unlink(ctx, 1, "vmdisk-clone"); st != 0 {
+		t.Fatalf("unlink clone: %s", st)
+	}
+	waitDeleted(first)
+	if deletedTimes(base) != 0 {
+		t.Fatalf("deleted the base while the original references it")
+	}
+	if st := m.Unlink(ctx, 1, "vmdisk"); st != 0 {
+		t.Fatalf("unlink: %s", st)
+	}
+	waitDeleted(second)
+	waitDeleted(base)
+}
+
+// testKeepReadTrigger checks that reading an open VM disk compacts a chunk only
+// once it has keepReadTrigger runs, while other files still compact at 5.
+func testKeepReadTrigger(t *testing.T, m Meta) {
+	_ = m.Init(testFormat(), false)
+	if err := m.NewSession(false); err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	defer m.CloseSession()
+	m.OnMsg(DeleteSlice, func(args ...interface{}) error { return nil })
+	m.OnMsg(CompactChunk, func(args ...interface{}) error { return nil })
+	ctx := Background()
+	runs := func(inode Ino) int {
+		ss, st := m.getBase().en.doRead(ctx, inode, 0)
+		if st != 0 {
+			t.Fatalf("read chunk: %s", st)
+		}
+		return sliceRuns(ss)
+	}
+	// readUntil reads the chunk, which may start a compaction, and waits up to
+	// a second for its run count to satisfy ok.
+	readUntil := func(inode Ino, ok func(int) bool) int {
+		var cs []Slice
+		if st := m.Read(ctx, inode, 0, &cs); st != 0 {
+			t.Fatalf("read: %s", st)
+		}
+		n := runs(inode)
+		for i := 0; i < 20 && !ok(n); i++ {
+			time.Sleep(50 * time.Millisecond)
+			n = runs(inode)
+		}
+		return n
+	}
+	open := func(name string, vmDisk bool, writes int) Ino {
+		var inode Ino
+		attr := &Attr{}
+		_ = m.Unlink(ctx, 1, name)
+		if st := m.Create(ctx, 1, name, 0644, 022, 0, &inode, attr); st != 0 {
+			t.Fatalf("create %s: %s", name, st)
+		}
+		var id uint64
+		m.NewSlice(ctx, &id)
+		_ = m.Write(ctx, inode, 0, 0, Slice{Id: id, Size: ChunkSize, Len: ChunkSize}, time.Now())
+		if vmDisk {
+			if st := m.SetXattr(ctx, inode, ProfileXattr, []byte(ProfileVMDisk), 0); st != 0 {
+				t.Fatalf("setxattr: %s", st)
+			}
+		}
+		for i := 0; i < writes; i++ {
+			m.NewSlice(ctx, &id)
+			_ = m.Write(ctx, inode, 0, uint32(i)<<20, Slice{Id: id, Size: 8192, Len: 8192}, time.Now())
+		}
+		return inode
+	}
+
+	plain := open("plain-read", false, 5)
+	if n := readUntil(plain, func(n int) bool { return n < 6 }); n >= 6 {
+		t.Fatalf("reading a file with 6 runs did not compact it")
+	}
+
+	disk := open("vmdisk-read", true, 10)
+	if n := readUntil(disk, func(n int) bool { return n != 11 }); n != 11 {
+		t.Fatalf("reading a VM disk with 11 runs compacted it to %d runs", n)
+	}
+	var id uint64
+	for i := 10; i < keepReadTrigger-1; i++ {
+		m.NewSlice(ctx, &id)
+		_ = m.Write(ctx, disk, 0, uint32(i)<<20, Slice{Id: id, Size: 8192, Len: 8192}, time.Now())
+	}
+	if n := readUntil(disk, func(n int) bool { return n != keepReadTrigger }); n == keepReadTrigger {
+		t.Fatalf("reading a VM disk with %d runs did not compact it", keepReadTrigger)
+	}
+
+	for _, name := range []string{"plain-read", "vmdisk-read"} {
+		var inode Ino
+		if st := m.Lookup(ctx, 1, name, &inode, &Attr{}, false); st == 0 {
+			m.Close(ctx, inode)
+		}
+		_ = m.Unlink(ctx, 1, name)
 	}
 }
 
