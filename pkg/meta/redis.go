@@ -3582,6 +3582,11 @@ func (m *redisMeta) doCleanupSlices(ctx Context, count *uint64) error {
 }
 
 func (m *redisMeta) cleanupZeroRef(key string) {
+	err := m.cleanupZeroRefAtomic(key)
+	if err == nil {
+		return
+	}
+	logger.Debugf("Cleanup zero ref %s with a script: %s", key, err)
 	var ctx = Background()
 	_ = m.txn(ctx, func(tx *redis.Tx) error {
 		v, err := tx.HGet(ctx, m.sliceRefs(), key).Int()
