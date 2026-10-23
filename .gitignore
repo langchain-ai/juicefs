@@ -15,6 +15,15 @@ cmd/cmd
 .hypothesis
 /node_modules
 
+# local credentials and environments
+.env
+.env.*
+*.pem
+*.key
+*.crt
+credentials.json
+.venv/
+
 # os
 .DS_Store
 

@@ -292,6 +292,7 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 		Chunk:           chunkConf,
 		BackupMeta:      utils.Duration(c.String("backup-meta")),
 		BackupSkipTrash: c.Bool("backup-skip-trash"),
+		UsageExport:     c.Duration("usage-export"),
 		Port:            &vfs.Port{DebugAgent: debugAgent, PyroscopeAddr: c.String("pyroscope")},
 		PrefixInternal:  c.Bool("prefix-internal"),
 		Pid:             os.Getpid(),
@@ -311,6 +312,9 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 	skip_check := os.Getenv("SKIP_BACKUP_META_CHECK") == "true"
 	if !skip_check && cfg.BackupMeta > 0 && cfg.BackupMeta < time.Minute*5 {
 		logger.Fatalf("backup-meta should not be less than 5 minutes: %s", cfg.BackupMeta)
+	}
+	if cfg.UsageExport < 0 || cfg.UsageExport > 0 && cfg.UsageExport < 5*time.Minute {
+		logger.Fatalf("usage-export must be zero or at least 5 minutes: %s", cfg.UsageExport)
 	}
 	return cfg
 }
@@ -450,6 +454,9 @@ func initBackgroundTasks(c *cli.Context, vfsConf *vfs.Config, metaConf *meta.Con
 		go vfs.Backup(m, blob, vfsConf.BackupMeta, vfsConf.BackupSkipTrash)
 	} else {
 		logger.Warnf("Metadata backup is disabled")
+	}
+	if !metaConf.ReadOnly && !metaConf.NoBGJob && vfsConf.UsageExport > 0 {
+		go vfs.ExportUsage(c.Context, m, blob, vfsConf.UsageExport)
 	}
 	if !c.Bool("no-usage-report") {
 		go usage.ReportUsage(m, version.Version())
