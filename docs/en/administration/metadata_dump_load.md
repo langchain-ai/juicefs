@@ -209,3 +209,10 @@ Value: {
 ```
 
 > The binary backup is in PB format, and you can also use custom tools to verify and inspect the backup.
+
+## Usage-only exports
+
+For physical storage attribution, [`juicefs dump-usage`](./metadata_usage_export.md)
+exports compact active-tree paths and slice references. Optional automatic usage
+exports have their own schedule and object prefix. They cannot replace or be
+loaded as recovery backups.

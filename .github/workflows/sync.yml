@@ -29,7 +29,7 @@ on:
       - '.github/actions/upload-coverage/action.yml'
       - '.github/actions/mount-coverage-dir/action.yml'
       - '.github/actions/upload-total-coverage/action.yml'
-      
+
   workflow_dispatch:
     inputs:
       debug:
@@ -50,7 +50,7 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest-4-cores
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -70,7 +70,7 @@ jobs:
           secret_key: ${{ secrets.CI_COVERAGE_AWS_SK }}
           token: ${{ secrets.CI_COVERAGE_AWS_TOKEN }}
 
-      - name: Build 
+      - name: Build
         uses: ./.github/actions/build
 
       - name: Clean up
@@ -78,6 +78,12 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/.ghcup
           sudo docker system prune -af
           sudo df -h
+
+      - name: Prepare MinIO
+        if: matrix.type == 'sync_minio' || matrix.type == 'sync_cluster'
+        run: |
+          bash .github/scripts/setup_minio.sh sync
+          install -m 700 "$RUNNER_TEMP/juicefs-ci-minio/mc" ./mc
 
       - name: Test Sync
         timeout-minutes: 30
@@ -87,7 +93,7 @@ jobs:
           elif [[ "${{matrix.type}}" == 'sync_encrypt' ]]; then
             sudo GOCOVERDIR=$(pwd)/cover ENCRYPT=true META=redis .github/scripts/sync/sync.sh
           elif [[ "${{matrix.type}}" == 'sync_fsrand' ]]; then
-            if [[ -n "${{ github.event.inputs.seed }}" ]]; then 
+            if [[ -n "${{ github.event.inputs.seed }}" ]]; then
               seed=${{ github.event.inputs.seed }}
             elif [[ "${{github.event_name}}" == "pull_request" || "${{github.event_name}}" == "push" ]]; then
               seed=0
@@ -95,9 +101,9 @@ jobs:
               seed=$RANDOM
             fi
             echo "using seed: $seed"
-            sudo GOCOVERDIR=$(pwd)/cover META=redis SEED="$seed" .github/scripts/sync/sync_fsrand.sh 
+            sudo GOCOVERDIR=$(pwd)/cover META=redis SEED="$seed" .github/scripts/sync/sync_fsrand.sh
           elif [[ "${{matrix.type}}" == 'sync_minio' ]]; then
-            sudo GOCOVERDIR=$(pwd)/cover META=redis .github/scripts/sync/sync_minio.sh 
+            sudo GOCOVERDIR=$(pwd)/cover META=redis .github/scripts/sync/sync_minio.sh
           elif [[ "${{matrix.type}}" == 'sync_cluster' ]]; then
             wget https://juicefs-com-static.oss-cn-shanghai.aliyuncs.com/random-test/random-test
             chmod +x random-test
@@ -112,12 +118,16 @@ jobs:
             exit 1
           fi
 
+      - name: Stop MinIO
+        if: always() && (matrix.type == 'sync_minio' || matrix.type == 'sync_cluster')
+        run: bash .github/scripts/setup_minio.sh stop
+
       - name: upload coverage report
         timeout-minutes: 5
         continue-on-error: true
         uses: ./.github/actions/upload-coverage
         with:
-          UPLOAD_TOKEN: ${{ secrets.CI_COVERAGE_FILE_UPLOAD_AUTH_TOKEN }}          
+          UPLOAD_TOKEN: ${{ secrets.CI_COVERAGE_FILE_UPLOAD_AUTH_TOKEN }}
 
       - name: Setup upterm session
         if: failure() && (github.event.inputs.debug == 'true' || github.run_attempt != 1)
@@ -136,7 +146,7 @@ jobs:
       - name: Check Failure
         if: env.WORKFLOW_CONCLUSION == 'failure'
         run: exit 1
-      
+
       - name: mount coverage dir
         timeout-minutes: 5
         uses: ./.github/actions/mount-coverage-dir
@@ -154,7 +164,7 @@ jobs:
           UPLOAD_TOKEN: ${{ secrets.CI_COVERAGE_FILE_UPLOAD_AUTH_TOKEN }}
 
       - name: Send Slack Notification
-        if: failure() && github.event_name != 'workflow_dispatch' 
+        if: failure() && github.event_name != 'workflow_dispatch'
         uses: juicedata/slack-notify-action@main
         with:
           channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_JUICEFS_CE_CI_NOTIFY }}"

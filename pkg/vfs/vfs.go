@@ -135,6 +135,7 @@ type Config struct {
 	ReaddirCache         bool
 	BackupMeta           time.Duration
 	BackupSkipTrash      bool
+	UsageExport          time.Duration
 	FastResolve          bool   `json:",omitempty"`
 	AccessLog            string `json:",omitempty"`
 	Subdir               string `json:",omitempty"`

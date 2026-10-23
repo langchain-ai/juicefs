@@ -132,6 +132,14 @@ jobs:
           test=${{matrix.test}}
           make $test
 
+      - name: Stop MinIO
+        if: always() && (matrix.test == 'test.cmd' || matrix.test == 'test.pkg')
+        run: bash .github/scripts/setup_minio.sh stop
+
+      - name: Stop KeyDB
+        if: always() && matrix.test == 'test.meta.non-core'
+        run: bash .github/scripts/setup_keydb.sh stop
+
       - name: upload coverage report
         timeout-minutes: 5
         continue-on-error: true

@@ -136,7 +136,7 @@ install_tidb(){
         exit 1
     fi
     echo tiup is $tiup
-    
+
     # Reap orphaned pd-server/tikv-server/tidb-server left behind by a previous
     # retry attempt so a fresh cluster can bootstrap cleanly, see tiup#2057.
     kill_tiup_playground "$tiup" 4000 10080 2379 2380 20160 20180
@@ -243,7 +243,7 @@ start_meta_engine(){
     elif [ "$meta" == "fdb" ]; then
         if lsof -i:4500; then
             echo "fdb is already running"
-        else  
+        else
             docker run --name fdb --rm -d -p 4500:4500 foundationdb/foundationdb:6.3.23
             sleep 5
             docker exec fdb fdbcli --exec "configure new single memory"
@@ -273,9 +273,9 @@ start_meta_engine(){
             docker exec -i postgresql psql -U postgres -c "SHOW max_connections;"
         fi
     fi
-    
+
     if [ "$storage" == "minio" ]; then
-        if ! docker ps | grep "minio/minio"; then
+        if ! curl --fail --silent --max-time 1 http://127.0.0.1:9000/minio/health/ready > /dev/null; then
             docker run -d -p 9000:9000 --name minio \
                 -e "MINIO_ACCESS_KEY=minioadmin" \
                 -e "MINIO_SECRET_KEY=minioadmin" \

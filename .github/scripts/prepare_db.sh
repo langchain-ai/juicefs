@@ -51,17 +51,11 @@ install_etcd() {
 }
 
 install_keydb() {
-    echo "deb https://download.keydb.dev/open-source-dist $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/keydb.list
-    sudo wget -O /etc/apt/trusted.gpg.d/keydb.gpg https://download.keydb.dev/open-source-dist/keyring.gpg
-    sudo .github/scripts/apt_install.sh keydb
-    keydb-server --storage-provider flash /tmp/ --port 6378 --bind 127.0.0.1 --daemonize yes
-    keydb-server --port 6377 --bind 127.0.0.1 --daemonize yes
-    check_port 6377
-    check_port 6378
+    bash .github/scripts/setup_keydb.sh
 }
 
 install_minio() {
-    docker run -d -p 9000:9000 -p 9001:9001 -e "MINIO_ROOT_USER=testUser" -e "MINIO_ROOT_PASSWORD=testUserPassword" quay.io/minio/minio:RELEASE.2022-01-25T19-56-04Z server /data --console-address ":9001"
+    bash .github/scripts/setup_minio.sh
     go install github.com/minio/mc@RELEASE.2022-01-07T06-01-38Z && mc alias set local http://127.0.0.1:9000 testUser testUserPassword && mc mb local/testbucket
 }
 
