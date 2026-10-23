@@ -3,6 +3,10 @@ set -euo pipefail
 
 minio_dir="${RUNNER_TEMP:?RUNNER_TEMP must be set}/juicefs-ci-minio"
 minio_pid=""
+minio_address=127.0.0.1:9000
+minio_user=testUser
+minio_password=testUserPassword
+mode="${1:-start}"
 
 minio_running() {
     [[ "$(readlink "/proc/$minio_pid/exe" 2>/dev/null || true)" == "$minio_dir/minio" ]]
@@ -29,10 +33,15 @@ stop_minio() {
     rm -rf -- "$minio_dir"
 }
 
-case "${1:-start}" in
+case "$mode" in
     stop) stop_minio; exit ;;
     start) ;;
-    *) echo "Usage: $0 [start|stop]" >&2; exit 1 ;;
+    sync)
+        minio_address=0.0.0.0:9000
+        minio_user=minioadmin
+        minio_password=minioadmin
+        ;;
+    *) echo "Usage: $0 [start|sync|stop]" >&2; exit 1 ;;
 esac
 
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || {
@@ -61,10 +70,22 @@ printf '%s  %s\n' \
     "$minio_dir/minio" | sha256sum --check --status
 chmod 700 "$minio_dir/minio"
 
-MINIO_ROOT_USER=testUser MINIO_ROOT_PASSWORD=testUserPassword \
+if [[ "$mode" == sync ]]; then
+    client_version=RELEASE.2022-01-07T06-01-38Z
+    curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+        --proto '=https' --tlsv1.2 \
+        "https://github.com/minio/mc/releases/download/$client_version/mc.linux-amd64.$client_version" \
+        --output "$minio_dir/mc"
+    printf '%s  %s\n' \
+        65efbfa31d85aaed8cee12e502b04108bd908d207a0527942c3735fa7d74c4f9 \
+        "$minio_dir/mc" | sha256sum --check --status
+    chmod 700 "$minio_dir/mc"
+fi
+
+MINIO_ROOT_USER="$minio_user" MINIO_ROOT_PASSWORD="$minio_password" \
     nohup "$minio_dir/minio" --config-dir "$minio_dir/config" \
     --certs-dir "$minio_dir/certs" server "$minio_dir/data" \
-    --address 127.0.0.1:9000 --console-address 127.0.0.1:9001 \
+    --address "$minio_address" --console-address 127.0.0.1:9001 \
     > "$minio_dir/minio.log" 2>&1 &
 minio_pid=$!
 printf '%s\n' "$minio_pid" > "$minio_dir/pid"
