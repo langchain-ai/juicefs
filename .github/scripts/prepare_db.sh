@@ -61,11 +61,8 @@ install_keydb() {
 }
 
 install_minio() {
-    # MinIO no longer publishes images or binaries, so build the pinned release from the module proxy.
-    # Its old golang.org/x/net fails Go 1.23+'s linkname check.
-    go install -ldflags=-checklinkname=0 github.com/minio/minio@RELEASE.2022-01-25T19-56-04Z
-    MINIO_ROOT_USER=testUser MINIO_ROOT_PASSWORD=testUserPassword nohup "$(go env GOPATH)/bin/minio" server /tmp/minio-data --console-address ":9001" > /tmp/minio.log 2>&1 &
-    check_port 9000
+    bash .github/scripts/setup_minio.sh
+    # The pinned client's old golang.org/x/net needs this on Go 1.23+.
     go install -ldflags=-checklinkname=0 github.com/minio/mc@RELEASE.2022-01-07T06-01-38Z && mc alias set local http://127.0.0.1:9000 testUser testUserPassword && mc mb local/testbucket
 }
 
