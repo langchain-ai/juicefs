@@ -107,9 +107,22 @@ sidebar_position: 4
 | 名称                                     | 描述               | 单位 |
 |----------------------------------------| -----------        | ---- |
 | `juicefs_compact_size_histogram_bytes` | 合并数据的大小分布 | 字节 |
+| `juicefs_compactions_total` | 按触发原因统计的 chunk 合并次数（标签：`trigger`） | |
+| `juicefs_compacted_bytes_total` | 按触发原因统计的合并数据总大小（标签：`trigger`） | 字节 |
 | `juicefs_used_read_buffer_size_bytes`  | 当前用于读取的缓冲区的大小 |    |
 | `juicefs_bgjob_duration_seconds` | 后台清理任务耗时（标签：`job`、`status`） | 秒 |
 | `juicefs_bgjob_deletions_total` | 后台任务执行的删除总数（标签：`job`） | |
+
+`juicefs_compactions_total` 和 `juicefs_compacted_bytes_total` 的 `trigger` 标签表示触发合并的原因：
+
+- `write_interval`：写入使 chunk 的 slice 数量达到写入触发的合并间隔（`JFS_WRITE_COMPACTION_INTERVAL`，详见[随机写](../introduction/io_processing.md#random-write)）
+- `write_backlog`：写入后 chunk 中的 slice 超过 350 个
+- `write_sync`：写入使 chunk 的 slice 数量达到 2500 个或更多，该写入需等待合并完成
+- `read`：读取时发现 chunk 中有 5 个或更多 slice
+- `compact`：[`juicefs compact`](command_reference.mdx#compact)，由路径所在的挂载点执行
+- `gc`：[`juicefs gc --compact`](command_reference.mdx#gc)，在独立的进程中运行，因此其合并不会出现在挂载点的指标中
+
+这两个指标统计的合并与 `juicefs_compact_size_histogram_bytes` 观测到的合并相同（无论合并成功与否），因此除即将开始的合并外，它们按 `trigger` 求和后分别等于该直方图的 `_count` 和 `_sum`。slice 很多的 chunk 可能需要多次合并，每次都计入同一个触发原因。如需了解 `JFS_WRITE_COMPACTION_INTERVAL` 的效果，可以在修改前后按 `trigger` 比较这两个指标的增长速率：间隔越大，`write_interval` 合并越少；如果 `write_backlog` 或 `write_sync` 的计数增长，说明有 chunk 在合并前就达到了更高的阈值。
 
 ## 挂载配置 {#mount-configuration}
 
