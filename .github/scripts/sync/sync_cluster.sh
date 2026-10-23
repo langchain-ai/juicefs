@@ -57,7 +57,7 @@ configure_redis_for_cluster(){
 }
 
 start_minio(){
-    if ! docker ps | grep "minio/minio"; then
+    if ! curl --fail --silent --max-time 1 http://127.0.0.1:9000/minio/health/ready > /dev/null; then
         docker run -d -p 9000:9000 --name minio \
                 -e "MINIO_ACCESS_KEY=minioadmin" \
                 -e "MINIO_SECRET_KEY=minioadmin" \
@@ -129,7 +129,7 @@ test_sync_without_mount_point2(){
     dd if=/dev/urandom of=data/file$file_count bs=1M count=1024
     (./mc rb myminio/data > /dev/null 2>&1 --force || true) && ./mc mb myminio/data
     ./mc cp -r data myminio/data
-    
+
     # (./mc rb myminio/data1 > /dev/null 2>&1 --force || true) && ./mc mb myminio/data1
     set -o pipefail
     sudo -u juicedata meta_url=$CLUSTER_META_URL ./juicefs sync -v minio://minioadmin:minioadmin@172.20.0.1:9000/data/ jfs://meta_url/ \
@@ -163,7 +163,7 @@ test_sync_without_mount_point2(){
     ./mc rm -r --force myminio/data
     rm -rf data
     grep "panic:\|<FATAL>\|ERROR" sync.log && echo "panic or fatal or ERROR in sync.log" && exit 1 || true
-}   
+}
 
 test_sync_delete_src_and_update(){
     prepare_test
@@ -276,7 +276,7 @@ test_sync_with_random_test(){
          --list-threads 10 --list-depth 5 --check-all --links --start-time 2199-12-30 \
          --enable-checkpoint --checkpoint-interval 2s \
          >sync.log 2>&1
-    grep "panic:\|<FATAL>\|ERROR" sync.log && echo "panic or fatal in sync.log" && exit 1 || true 
+    grep "panic:\|<FATAL>\|ERROR" sync.log && echo "panic or fatal in sync.log" && exit 1 || true
     sudo -u juicedata meta_url=$CLUSTER_META_URL ./juicefs sync --mountpoint /jfs --delete-src --match-full-path jfs://meta_url/test/ jfs://meta_url/test2/ \
          --manager-addr 172.20.0.1:8081 --worker juicedata@172.20.0.2,juicedata@172.20.0.3 --dirs \
          --list-threads 10 --list-depth 5 --check-all --links --start-time "$current_time" \
@@ -358,7 +358,7 @@ skip_test_sync_between_oss(){
 test_sync_worker_down(){
     prepare_test
     ./juicefs mount -d $META_URL /jfs
-    file_count=$FILE_COUNT 
+    file_count=$FILE_COUNT
     mkdir -p /jfs/data
     for i in $(seq 1 $file_count); do
         echo "test-$i" > /jfs/data/test-$i

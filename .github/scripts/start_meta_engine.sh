@@ -92,7 +92,7 @@ install_tidb(){
         exit 1
     fi
     echo tiup is $tiup
-    
+
     $tiup playground 8.5.5 > tidb.log 2>&1  &
     pid=$!
     timeout=60
@@ -156,7 +156,7 @@ start_meta_engine(){
     elif [ "$meta" == "fdb" ]; then
         if lsof -i:4500; then
             echo "fdb is already running"
-        else  
+        else
             docker run --name fdb --rm -d -p 4500:4500 foundationdb/foundationdb:6.3.23
             sleep 5
             docker exec fdb fdbcli --exec "configure new single memory"
@@ -186,9 +186,9 @@ start_meta_engine(){
             docker exec -i postgresql psql -U postgres -c "SHOW max_connections;"
         fi
     fi
-    
+
     if [ "$storage" == "minio" ]; then
-        if ! docker ps | grep "minio/minio"; then
+        if ! curl --fail --silent --max-time 1 http://127.0.0.1:9000/minio/health/ready > /dev/null; then
             docker run -d -p 9000:9000 --name minio \
                 -e "MINIO_ACCESS_KEY=minioadmin" \
                 -e "MINIO_SECRET_KEY=minioadmin" \
