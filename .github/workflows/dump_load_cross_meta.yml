@@ -75,27 +75,36 @@ jobs:
       - name: Build
         timeout-minutes: 10
         uses: ./.github/actions/build
-        with: 
+        with:
           target: ${{steps.vars.outputs.target}}
+
+      - name: Prepare MinIO
+        run: |
+          bash .github/scripts/setup_minio.sh dump
+          sudo install -m 0755 "$RUNNER_TEMP/juicefs-ci-minio/mc" /usr/local/bin/mc
 
       - name: Test Load & Dump with Json Fast Mode
         timeout-minutes: 30
         run: |
-          sudo GOCOVERDIR=$(pwd)/cover META1=${{matrix.meta1}} META2=${{matrix.meta2}} FAST=true .github/scripts/command/dump_load_cross_meta.sh  
-    
+          sudo GOCOVERDIR=$(pwd)/cover META1=${{matrix.meta1}} META2=${{matrix.meta2}} FAST=true .github/scripts/command/dump_load_cross_meta.sh
+
       - name: Test Load & Dump with Binary
         timeout-minutes: 30
         run: |
           sudo GOCOVERDIR=$(pwd)/cover META1=${{matrix.meta1}} META2=${{matrix.meta2}} BINARY=true .github/scripts/command/dump_load_cross_meta.sh
-      
+
       - name: Test Load & Dump with Json
         timeout-minutes: 30
         run: |
-          sudo GOCOVERDIR=$(pwd)/cover META1=${{matrix.meta1}} META2=${{matrix.meta2}} .github/scripts/command/dump_load_cross_meta.sh     
+          sudo GOCOVERDIR=$(pwd)/cover META1=${{matrix.meta1}} META2=${{matrix.meta2}} .github/scripts/command/dump_load_cross_meta.sh
+
+      - name: Stop MinIO
+        if: always()
+        run: bash .github/scripts/setup_minio.sh stop
 
       - name: log
         if: always()
-        run: | 
+        run: |
           tail -500 /var/log/juicefs.log
           grep "<FATAL>:" /var/log/juicefs.log && exit 1 || true
 
@@ -152,7 +161,7 @@ jobs:
           UPLOAD_TOKEN: ${{ secrets.CI_COVERAGE_FILE_UPLOAD_AUTH_TOKEN }}
 
       - name: Send Slack Notification
-        if: failure() && github.event_name != 'workflow_dispatch' 
+        if: failure() && github.event_name != 'workflow_dispatch'
         uses: juicedata/slack-notify-action@main
         with:
           channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_JUICEFS_CE_CI_NOTIFY }}"
@@ -162,5 +171,3 @@ jobs:
       - name: Success
         if: success()
         run: echo "All Done"
-              
-        
