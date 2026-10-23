@@ -153,6 +153,7 @@ jobs:
       - name: run mutate test
         # timeout-minutes: 120
         run: |
+          sudo mkdir -p /var/jfsCache
           sudo chmod 777 /var/jfsCache
           test_file=$(echo ${{matrix.test_file}} | awk -F'-' '{print $1}')
           job_index=$(echo ${{matrix.test_file}} | awk -F'-' '{print $2}')
@@ -195,8 +196,14 @@ jobs:
           # COVERAGE_FILE=mutest-cov.out TEST_FILE_NAME="$test_file" PACKAGE_PATH="$package_path" go-mutesting $source_file --debug --exec=.github/scripts/mutate/mutest.sh  --do-not-remove-tmp-folder --blacklist $black_list_file
           if [ $? != 0 ]; then echo "run mutesting.py failed" && exit 1; fi
 
-          [[ -z "${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}} " ]] && echo "<WARNING>: MYSQL_PASSWORD is empty" && exit 0
-          export MYSQL_PASSWORD=${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
+      - name: Save mutate report
+        env:
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD_FOR_JUICEDATA }}
+        run: |
+          if [[ -z "$MYSQL_PASSWORD" ]]; then
+            echo "<WARNING>: MYSQL_PASSWORD is empty"
+            exit 0
+          fi
           JOB_NAME=${{matrix.test_file}} JOB_URL=${{steps.jobs.outputs.html_url}}  STAT_RESULT_FILE=stat_result.log python3 .github/scripts/mutate/save_report.py
 
       - name: Stop MinIO
@@ -225,9 +232,13 @@ jobs:
           sudo pip install mysqlclient
 
       - name: Generate mutate report
+        env:
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD_FOR_JUICEDATA }}
         run: |
-          [[ -z "${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}} " ]] && echo "<WARNING>: MYSQL_PASSWORD is empty" && exit 0
-          export MYSQL_PASSWORD=${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
+          if [[ -z "$MYSQL_PASSWORD" ]]; then
+            echo "<WARNING>: MYSQL_PASSWORD is empty"
+            exit 0
+          fi
           mutate_report=$(python3 .github/scripts/mutate/query_report.py)
           echo "mutate_report is $mutate_report"
           # echo "mutate_report=$mutate_report" >> $GITHUB_ENV
