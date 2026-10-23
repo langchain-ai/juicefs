@@ -79,7 +79,7 @@ hardlinks appear once for each path. Paths start with `/` and use the same
 percent escaping as JSON recovery dumps: control bytes, spaces, invalid UTF-8
 bytes, percent signs, quotes, and backslashes are encoded as `%XX`. Separators
 remain `/`. Decode escapes exactly once if raw filename bytes are needed; avoid
-URL or filesystem path normalization.
+URL or file system path normalization.
 
 Each slice record belongs to the immediately preceding entry. Only `regular`
 entries have slices. Chunk indices are visited in ascending order and each
@@ -99,10 +99,10 @@ headers/completion records, unknown record types, invalid ordering, count or
 checksum mismatches, trailing data, and truncated or corrupt gzip streams. Read
 through EOF and validate gzip integrity before publishing derived results. A
 valid checksum establishes complete transmission, not authenticity; protect
-access to exported filesystem paths using the volume's normal storage controls.
+access to exported file system paths using the volume's normal storage controls.
 
 An encoded record including LF is limited to 1 MiB, percent-escaped paths to 64 KiB,
 and directory depth to 1,024. Exceeding a limit fails the export. The traversal
-is live, as with JSON recovery dumps; it is not a point-in-time filesystem
+is live, as with JSON recovery dumps; it is not a point-in-time file system
 snapshot. Concurrent creates, deletes, writes, and renames can affect which
 references are observed between the start and completion timestamps.
