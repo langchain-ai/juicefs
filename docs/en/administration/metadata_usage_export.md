@@ -3,8 +3,6 @@ title: Compact usage exports
 sidebar_position: 8
 ---
 
-# Compact usage exports
-
 `juicefs dump-usage META-URL [FILE]` exports the active volume tree for physical
 storage attribution. It includes paths and raw slice references, including
 overwritten references that still occupy storage. It excludes Trash, detached
