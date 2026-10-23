@@ -297,6 +297,10 @@ func metaFlags() []cli.Flag {
 			Name:  "backup-skip-trash",
 			Usage: "skip files in trash when backup metadata",
 		},
+		&cli.DurationFlag{
+			Name:  "usage-export",
+			Usage: "interval to export compact active-tree usage to object storage (0 disables, minimum 5m)",
+		},
 		&cli.StringFlag{
 			Name:  "heartbeat",
 			Value: "12s",

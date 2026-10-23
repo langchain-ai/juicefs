@@ -542,6 +542,9 @@ type Meta interface {
 	// Dump the tree under root, which may be modified by checkRoot
 	DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, skipTrash bool) error
 	LoadMeta(r io.Reader) error
+	// DumpUsage streams active-tree paths and physical slice references as NDJSON.
+	// It always starts at the volume root, including for a subdirectory mount.
+	DumpUsage(ctx Context, w io.Writer, opt *UsageDumpOption) error
 
 	DumpMetaV2(ctx Context, w io.Writer, opt *DumpOption) error
 	LoadMetaV2(ctx Context, r io.Reader, opt *LoadOption) error
