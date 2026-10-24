@@ -113,7 +113,7 @@ func newCacheGroup(conf *Config) (*cacheGroup, error) {
 		}},
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "cache_group_requests",
-			Help: "Blocks asked of a cache group owner, by result: hit (owner had it cached), loaded (owner fetched it from object storage), error (fell back to object storage), down (owner skipped as recently failed).",
+			Help: "Blocks asked of a cache group owner, by result: hit (owner had it cached), loaded (owner fetched it from object storage), down (owner skipped as recently failed), canceled (the read was abandoned), or why the request failed and fell back to object storage: timeout, connect, status_4xx, status_5xx, short_read, checksum.",
 		}, []string{"result"}),
 		latency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "cache_group_request_durations_histogram_seconds",
@@ -250,7 +250,7 @@ func (g *cacheGroup) fetch(ctx context.Context, key string, buf []byte) error {
 		return fmt.Errorf("cache group member %s is down", member)
 	}
 	start := time.Now()
-	result := "error"
+	result := "connect"
 	defer func() {
 		g.requests.WithLabelValues(result).Inc()
 		g.latency.WithLabelValues(result).Observe(time.Since(start).Seconds())
@@ -264,7 +264,13 @@ func (g *cacheGroup) fetch(ctx context.Context, key string, buf []byte) error {
 	}
 	resp, err := g.client.Do(req)
 	if err != nil {
-		if ctx.Err() == nil {
+		switch {
+		case ctx.Err() != nil: // the caller gave up; the owner is fine
+			result = "canceled"
+		case errors.Is(cctx.Err(), context.DeadlineExceeded):
+			result = "timeout"
+			g.markDown(member)
+		default:
 			g.markDown(member)
 		}
 		return err
@@ -272,16 +278,23 @@ func (g *cacheGroup) fetch(ctx context.Context, key string, buf []byte) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		result = "status_4xx"
 		if resp.StatusCode >= 500 {
+			result = "status_5xx"
 			g.markDown(member)
 		}
 		return fmt.Errorf("cache group member %s: %s", member, resp.Status)
 	}
 	if n, err := io.ReadFull(resp.Body, buf); err != nil {
+		result = "short_read"
+		if ctx.Err() != nil {
+			result = "canceled"
+		}
 		return fmt.Errorf("cache group member %s: read %d of %d bytes: %w", member, n, len(buf), err)
 	}
 	want, err := strconv.ParseUint(resp.Header.Get(cacheGroupChecksumHdr), 10, 32)
 	if err != nil || uint32(want) != crc32.Checksum(buf, crc32c) {
+		result = "checksum"
 		return fmt.Errorf("cache group member %s: checksum mismatch for %s", member, key)
 	}
 	result = resp.Header.Get("X-Jfs-Source")

@@ -165,7 +165,7 @@ func TestCacheGroupFetchesEachBlockOnce(t *testing.T) {
 	if got := storage.gets.Load(); got != nBlocks {
 		for i, st := range stores {
 			g := st.(*cachedStore).cacheGroup
-			t.Logf("member %d (%s): hit=%v loaded=%v error=%v down=%v", i, g.self, testutilCount(g, "hit"), testutilCount(g, "loaded"), testutilCount(g, "error"), testutilCount(g, "down"))
+			t.Logf("member %d (%s): hit=%v loaded=%v connect=%v timeout=%v down=%v", i, g.self, testutilCount(g, "hit"), testutilCount(g, "loaded"), testutilCount(g, "connect"), testutilCount(g, "timeout"), testutilCount(g, "down"))
 		}
 		t.Fatalf("object storage GETs = %d, want %d (one per block across the group)", got, nBlocks)
 	}
@@ -310,4 +310,39 @@ func maxDuration(a, b time.Duration) time.Duration {
 		return a
 	}
 	return b
+}
+
+func TestCacheGroupCountsCanceledReadsWithoutMarkingTheOwnerDown(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	storage := &countingStorage{ObjectStorage: mem}
+	const id, nBlocks = 13, 1
+	writeSlice(t, storage, id, nBlocks)
+	storage.delay = 500 * time.Millisecond // the owner's object-storage load outlives the caller
+
+	addrs := freeAddrs(t, 2)
+	stores := groupStores(t, storage, strings.Join(addrs, ","), addrs)
+	key := fmt.Sprintf("chunks/0/0/%d_0_%d", id, defaultConf.BlockSize)
+	var from, owner *cacheGroup
+	for _, s := range stores {
+		g := s.(*cachedStore).cacheGroup
+		if g.owner(key) == g.self {
+			owner = g
+		} else {
+			from = g
+		}
+	}
+	if from == nil || owner == nil {
+		t.Fatal("expected one owner and one other member")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := from.fetch(ctx, key, make([]byte, defaultConf.BlockSize)); err == nil {
+		t.Fatal("fetch succeeded although the caller gave up")
+	}
+	if got := testutilCount(from, "canceled"); got != 1 {
+		t.Fatalf("canceled = %v, want 1", got)
+	}
+	if from.isDown(owner.self) {
+		t.Fatal("a canceled read marked the owner down")
+	}
 }
