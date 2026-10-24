@@ -48,6 +48,7 @@ import (
 const (
 	cacheGroupPath           = "/jfs/cache-group/v1/block"
 	cacheGroupChecksumHdr    = "X-Jfs-Crc32c"
+	cacheGroupHopsHdr        = "X-Jfs-Hops"
 	cacheGroupDefaultTO      = 5 * time.Second
 	cacheGroupRefresh        = 10 * time.Second
 	cacheGroupDownFor        = 30 * time.Second
@@ -61,15 +62,26 @@ var (
 
 type fromPeerKey struct{}
 
-// fromPeer reports whether ctx belongs to a request another member sent, which must never be forwarded again.
-func fromPeer(ctx context.Context) bool {
-	v, _ := ctx.Value(fromPeerKey{}).(bool)
+// peerHops is how many members a request in ctx has passed through: 0 for this client's own reads, 1 for a request
+// another member sent, 2 for one a secondary owner forwarded to the primary.
+func peerHops(ctx context.Context) int {
+	v, _ := ctx.Value(fromPeerKey{}).(int)
 	return v
+}
+
+func withPeerHops(ctx context.Context, hops int) context.Context {
+	return context.WithValue(ctx, fromPeerKey{}, hops)
+}
+
+// fromPeer reports whether ctx belongs to a request another member sent.
+func fromPeer(ctx context.Context) bool {
+	return peerHops(ctx) > 0
 }
 
 type cacheGroup struct {
 	self        string
 	noLocalCopy bool
+	replicas    int    // owners per block
 	peers       string // comma-separated host:port list, or dns:<name>:<port>
 	members     atomic.Pointer[[]string]
 	client      *http.Client
@@ -99,9 +111,14 @@ func newCacheGroup(conf *Config) (*cacheGroup, error) {
 	if timeout <= 0 {
 		timeout = cacheGroupDefaultTO
 	}
+	replicas := conf.CacheGroupReplicas
+	if replicas < 1 {
+		replicas = 1
+	}
 	g := &cacheGroup{
 		self:        self,
 		noLocalCopy: conf.CacheGroupNoLocalCopy,
+		replicas:    replicas,
 		peers:       conf.CacheGroupPeers,
 		timeout:     timeout,
 		down:        make(map[string]time.Time),
@@ -197,25 +214,77 @@ func (g *cacheGroup) refresh() error {
 	return nil
 }
 
-// owner returns the member that owns key: the one with the highest hash of key and member address. Adding or removing
-// a member moves only the keys it owns.
-func (g *cacheGroup) owner(key string) string {
+func rendezvousScore(parts ...string) uint64 {
+	h := murmur3.New64()
+	for i, p := range parts {
+		if i > 0 {
+			_, _ = h.Write([]byte{0})
+		}
+		_, _ = h.Write([]byte(p))
+	}
+	return h.Sum64()
+}
+
+// owners returns the members that own key, primary first: the replicas members with the highest hash of key and
+// member address. Adding or removing a member moves only the keys it owns.
+func (g *cacheGroup) owners(key string) []string {
 	members := g.members.Load()
 	if members == nil || len(*members) == 0 {
-		return g.self
+		return []string{g.self}
 	}
-	var best string
-	var bestScore uint64
-	for _, m := range *members {
-		h := murmur3.New64()
-		_, _ = h.Write([]byte(key))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(m))
-		if s := h.Sum64(); best == "" || s > bestScore {
-			best, bestScore = m, s
+	ranked := append([]string(nil), *members...)
+	scores := make(map[string]uint64, len(ranked))
+	for _, m := range ranked {
+		scores[m] = rendezvousScore(key, m)
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if scores[ranked[i]] != scores[ranked[j]] {
+			return scores[ranked[i]] > scores[ranked[j]]
+		}
+		return ranked[i] < ranked[j]
+	})
+	return ranked[:min(max(g.replicas, 1), len(ranked))]
+}
+
+// owner returns key's primary owner.
+func (g *cacheGroup) owner(key string) string {
+	return g.owners(key)[0]
+}
+
+// isOwner reports whether this member is one of key's owners.
+func (g *cacheGroup) isOwner(key string) bool {
+	for _, m := range g.owners(key) {
+		if m == g.self {
+			return true
 		}
 	}
-	return best
+	return false
+}
+
+// askOrder lists the members a load of key in ctx asks, in order, before going to object storage. The primary owner
+// asks no one. A secondary owner asks the primary, for its own reads and once for a request another member sent, so the
+// group loads each block from object storage about once. Any other member asks the owners, each member preferring a
+// different one so the owners share the load; a request that reached a non-owner (membership views can briefly
+// differ) is not forwarded again.
+func (g *cacheGroup) askOrder(ctx context.Context, key string) []string {
+	owners := g.owners(key)
+	if owners[0] == g.self {
+		return nil
+	}
+	hops := peerHops(ctx)
+	if g.isOwner(key) {
+		if hops <= 1 {
+			return owners[:1]
+		}
+		return nil
+	}
+	if hops > 0 {
+		return nil
+	}
+	sort.SliceStable(owners, func(i, j int) bool {
+		return rendezvousScore(key, g.self, owners[i]) > rendezvousScore(key, g.self, owners[j])
+	})
+	return owners
 }
 
 // keepFetched reports whether this member caches a block it fetched from the block's owner.
@@ -226,12 +295,12 @@ func (g *cacheGroup) keepFetched() bool {
 // keepsLocally reports whether this member caches key after loading it: always unless key belongs to another member
 // and copies of other members' blocks are off.
 func (g *cacheGroup) keepsLocally(key string) bool {
-	return g.keepFetched() || g.owner(key) == g.self
+	return g.keepFetched() || g.isOwner(key)
 }
 
 // remote reports whether a load of key would ask another member.
 func (g *cacheGroup) remote(ctx context.Context, key string) bool {
-	return g != nil && !fromPeer(ctx) && g.owner(key) != g.self
+	return g != nil && len(g.askOrder(ctx, key)) > 0
 }
 
 func (g *cacheGroup) isDown(member string) bool {
@@ -251,13 +320,24 @@ func (g *cacheGroup) markDown(member string) {
 	g.downMu.Unlock()
 }
 
-// fetch reads key's whole block from its owner into buf, which must be the block's exact size. It returns
-// errCacheGroupSelf when this member owns the block, and any other error means the caller should go to object storage.
+// fetch reads key's whole block into buf, which must be the block's exact size, from the first member in askOrder that
+// answers. It returns errCacheGroupSelf when there is no one to ask, and any other error means the caller should go to
+// object storage.
 func (g *cacheGroup) fetch(ctx context.Context, key string, buf []byte) error {
-	member := g.owner(key)
-	if member == g.self {
+	order := g.askOrder(ctx, key)
+	if len(order) == 0 {
 		return errCacheGroupSelf
 	}
+	var err error
+	for _, member := range order {
+		if err = g.fetchFrom(ctx, member, key, buf); err == nil || ctx.Err() != nil {
+			return err
+		}
+	}
+	return err
+}
+
+func (g *cacheGroup) fetchFrom(ctx context.Context, member, key string, buf []byte) error {
 	if g.isDown(member) {
 		g.requests.WithLabelValues("down").Inc()
 		return fmt.Errorf("cache group member %s is down", member)
@@ -275,6 +355,7 @@ func (g *cacheGroup) fetch(ctx context.Context, key string, buf []byte) error {
 	if err != nil {
 		return err
 	}
+	req.Header.Set(cacheGroupHopsHdr, strconv.Itoa(peerHops(ctx)+1))
 	resp, err := g.client.Do(req)
 	if err != nil {
 		switch {
@@ -373,7 +454,11 @@ func (store *cachedStore) serveCacheGroupBlock(w http.ResponseWriter, r *http.Re
 		// Finish the load even if the member that asked hangs up (a reader often abandons readahead within ~10 ms):
 		// the block is cached here for the next member that asks, rather than fetched from object storage again.
 		// The load is still bounded by the store's GET timeout.
-		ctx := context.WithValue(context.WithoutCancel(r.Context()), fromPeerKey{}, true)
+		hops, err := strconv.Atoi(r.Header.Get(cacheGroupHopsHdr))
+		if err != nil || hops < 1 {
+			hops = 1
+		}
+		ctx := withPeerHops(context.WithoutCancel(r.Context()), hops)
 		p := NewOffPage(size)
 		defer p.Release()
 		block, err := store.executeShared(ctx, key, func() (*Page, error) {
