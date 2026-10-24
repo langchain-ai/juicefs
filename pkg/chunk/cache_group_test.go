@@ -346,3 +346,40 @@ func TestCacheGroupCountsCanceledReadsWithoutMarkingTheOwnerDown(t *testing.T) {
 		t.Fatal("a canceled read marked the owner down")
 	}
 }
+
+func TestCacheGroupOwnerCachesABlockItsAskerAbandoned(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	storage := &countingStorage{ObjectStorage: mem}
+	const id, nBlocks = 17, 1
+	data := writeSlice(t, storage, id, nBlocks)
+	storage.gets.Store(0)
+	storage.delay = 300 * time.Millisecond
+
+	addrs := freeAddrs(t, 2)
+	stores := groupStores(t, storage, strings.Join(addrs, ","), addrs)
+	key := fmt.Sprintf("chunks/0/0/%d_0_%d", id, defaultConf.BlockSize)
+	var asker *cacheGroup
+	for _, s := range stores {
+		if g := s.(*cachedStore).cacheGroup; g.owner(key) != g.self {
+			asker = g
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	_ = asker.fetch(ctx, key, make([]byte, defaultConf.BlockSize)) // gives up long before the owner's load ends
+
+	time.Sleep(500 * time.Millisecond) // the owner's load finishes and caches the block
+	buf := make([]byte, defaultConf.BlockSize)
+	if err := asker.fetch(context.Background(), key, buf); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, data) {
+		t.Fatal("wrong data")
+	}
+	if got := testutilCount(asker, "hit"); got != 1 {
+		t.Fatalf("second ask: hit = %v, want 1 (the owner should have kept the abandoned load)", got)
+	}
+	if got := storage.gets.Load(); got != 1 {
+		t.Fatalf("object storage GETs = %d, want 1", got)
+	}
+}

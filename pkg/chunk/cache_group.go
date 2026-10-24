@@ -357,7 +357,10 @@ func (store *cachedStore) serveCacheGroupBlock(w http.ResponseWriter, r *http.Re
 	}
 	if data == nil {
 		source = "object"
-		ctx := context.WithValue(r.Context(), fromPeerKey{}, true)
+		// Finish the load even if the member that asked hangs up (a reader often abandons readahead within ~10 ms):
+		// the block is cached here for the next member that asks, rather than fetched from object storage again.
+		// The load is still bounded by the store's GET timeout.
+		ctx := context.WithValue(context.WithoutCancel(r.Context()), fromPeerKey{}, true)
 		p := NewOffPage(size)
 		defer p.Release()
 		block, err := store.executeShared(ctx, key, func() (*Page, error) {
