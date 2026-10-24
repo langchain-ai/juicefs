@@ -208,6 +208,23 @@ func dataCacheFlags() []cli.Flag {
 			Value: 1,
 			Usage: "prefetch N blocks in parallel",
 		},
+		&cli.StringFlag{
+			Name:  "cache-group-peers",
+			Usage: "share block caches with these clients: comma-separated host:port list, or dns:<name>:<port> (e.g. a headless Service)",
+		},
+		&cli.StringFlag{
+			Name:  "cache-group-listen",
+			Usage: "address to serve cached blocks to the cache group on (e.g. :9568); empty joins without serving",
+		},
+		&cli.StringFlag{
+			Name:  "cache-group-self",
+			Usage: "address other cache group members know this client by (default: derived from cache-group-listen)",
+		},
+		&cli.StringFlag{
+			Name:  "cache-group-timeout",
+			Value: "5s",
+			Usage: "timeout for one block request to a cache group member before reading object storage",
+		},
 		&cli.BoolFlag{
 			Name:  "writeback",
 			Usage: "upload blocks in background",
