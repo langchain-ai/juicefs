@@ -570,6 +570,9 @@ type Config struct {
 	CacheGroupSelf string
 	// CacheGroupTimeout bounds one block request to an owner before falling back to object storage.
 	CacheGroupTimeout time.Duration
+	// CacheGroupNoLocalCopy leaves a block fetched from its owner out of this member's cache, so each block is cached
+	// once in the group (on its owner) instead of on every member that reads it.
+	CacheGroupNoLocalCopy bool
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -809,7 +812,7 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 			// The group relies on the owner keeping its blocks, whatever cache-partial-only says.
 			cache, forceCache = true, true
 		} else if err := g.fetch(ctx, key, page.Data); err == nil {
-			if cache {
+			if cache && g.keepFetched() {
 				store.bcache.cache(key, page, forceCache, !store.conf.OSCache)
 			}
 			return nil
@@ -982,7 +985,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 			return p, err
 		})
 		defer block.Release()
-		if err == nil && block == p {
+		if err == nil && block == p && store.cacheGroup.keepsLocally(key) {
 			store.bcache.cache(key, block, true, !store.conf.OSCache)
 		}
 	})

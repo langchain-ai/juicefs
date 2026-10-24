@@ -68,19 +68,20 @@ func fromPeer(ctx context.Context) bool {
 }
 
 type cacheGroup struct {
-	self     string
-	peers    string // comma-separated host:port list, or dns:<name>:<port>
-	members  atomic.Pointer[[]string]
-	client   *http.Client
-	timeout  time.Duration
-	server   *http.Server
-	downMu   sync.Mutex
-	down     map[string]time.Time
-	resolve  func(host string) ([]string, error)
-	requests *prometheus.CounterVec
-	latency  *prometheus.HistogramVec
-	served   *prometheus.CounterVec
-	bytes    *prometheus.CounterVec
+	self        string
+	noLocalCopy bool
+	peers       string // comma-separated host:port list, or dns:<name>:<port>
+	members     atomic.Pointer[[]string]
+	client      *http.Client
+	timeout     time.Duration
+	server      *http.Server
+	downMu      sync.Mutex
+	down        map[string]time.Time
+	resolve     func(host string) ([]string, error)
+	requests    *prometheus.CounterVec
+	latency     *prometheus.HistogramVec
+	served      *prometheus.CounterVec
+	bytes       *prometheus.CounterVec
 }
 
 func newCacheGroup(conf *Config) (*cacheGroup, error) {
@@ -99,11 +100,12 @@ func newCacheGroup(conf *Config) (*cacheGroup, error) {
 		timeout = cacheGroupDefaultTO
 	}
 	g := &cacheGroup{
-		self:    self,
-		peers:   conf.CacheGroupPeers,
-		timeout: timeout,
-		down:    make(map[string]time.Time),
-		resolve: net.LookupHost,
+		self:        self,
+		noLocalCopy: conf.CacheGroupNoLocalCopy,
+		peers:       conf.CacheGroupPeers,
+		timeout:     timeout,
+		down:        make(map[string]time.Time),
+		resolve:     net.LookupHost,
 		client: &http.Client{Transport: &http.Transport{
 			Proxy:               nil,
 			DialContext:         (&net.Dialer{Timeout: time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -214,6 +216,17 @@ func (g *cacheGroup) owner(key string) string {
 		}
 	}
 	return best
+}
+
+// keepFetched reports whether this member caches a block it fetched from the block's owner.
+func (g *cacheGroup) keepFetched() bool {
+	return g == nil || !g.noLocalCopy
+}
+
+// keepsLocally reports whether this member caches key after loading it: always unless key belongs to another member
+// and copies of other members' blocks are off.
+func (g *cacheGroup) keepsLocally(key string) bool {
+	return g.keepFetched() || g.owner(key) == g.self
 }
 
 // remote reports whether a load of key would ask another member.
