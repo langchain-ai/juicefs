@@ -220,6 +220,11 @@ func dataCacheFlags() []cli.Flag {
 			Name:  "cache-group-self",
 			Usage: "address other cache group members know this client by (default: derived from cache-group-listen)",
 		},
+		&cli.BoolFlag{
+			Name:  "cache-group-local-copy",
+			Value: true,
+			Usage: "also cache blocks fetched from their cache group owner on this client; false caches each block once in the group, on its owner",
+		},
 		&cli.StringFlag{
 			Name:  "cache-group-timeout",
 			Value: "5s",

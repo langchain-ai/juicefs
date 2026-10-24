@@ -383,3 +383,57 @@ func TestCacheGroupOwnerCachesABlockItsAskerAbandoned(t *testing.T) {
 		t.Fatalf("object storage GETs = %d, want 1", got)
 	}
 }
+
+func TestCacheGroupLocalCopy(t *testing.T) {
+	for _, noLocalCopy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("noLocalCopy=%v", noLocalCopy), func(t *testing.T) {
+			mem, _ := object.CreateStorage("mem", "", "", "", "")
+			storage := &countingStorage{ObjectStorage: mem}
+			const id, nBlocks = 19, 6
+			data := writeSlice(t, storage, id, nBlocks)
+			addrs := freeAddrs(t, 2)
+			var stores []ChunkStore
+			for _, a := range addrs {
+				conf := defaultConf
+				conf.CacheDir = groupCacheDir(t)
+				conf.CacheSize = 100 << 20
+				conf.CacheFullBlock = true
+				conf.CacheGroupPeers = strings.Join(addrs, ",")
+				conf.CacheGroupListen, conf.CacheGroupSelf = a, a
+				conf.CacheGroupNoLocalCopy = noLocalCopy
+				stores = append(stores, NewCachedStore(storage, conf, nil))
+			}
+			reader := stores[1].(*cachedStore)
+			var remote []int // blocks the reader does not own
+			for i := 0; i < nBlocks; i++ {
+				if reader.cacheGroup.owner(fmt.Sprintf("chunks/0/0/%d_%d_%d", id, i, defaultConf.BlockSize)) != reader.cacheGroup.self {
+					remote = append(remote, i)
+				}
+			}
+			if len(remote) == 0 {
+				t.Skip("the reader owns every block")
+			}
+			for round := 0; round < 2; round++ {
+				for _, i := range remote {
+					if got := readBlock(t, reader, id, len(data), i); !bytes.Equal(got, data[i*defaultConf.BlockSize:(i+1)*defaultConf.BlockSize]) {
+						t.Fatalf("block %d: wrong data", i)
+					}
+				}
+			}
+			asks := testutilCount(reader.cacheGroup, "hit") + testutilCount(reader.cacheGroup, "loaded")
+			want := float64(len(remote)) // first round only: the second reads the local copy
+			if noLocalCopy {
+				want = float64(2 * len(remote)) // every read asks the owner
+			}
+			if asks != want {
+				t.Fatalf("asks of the owner = %v, want %v", asks, want)
+			}
+			for _, i := range remote {
+				key := fmt.Sprintf("chunks/0/0/%d_%d_%d", id, i, defaultConf.BlockSize)
+				if cached := reader.loadCached(key, make([]byte, defaultConf.BlockSize)); cached == noLocalCopy {
+					t.Fatalf("block %d cached on the reader = %v with noLocalCopy=%v", i, cached, noLocalCopy)
+				}
+			}
+		})
+	}
+}
