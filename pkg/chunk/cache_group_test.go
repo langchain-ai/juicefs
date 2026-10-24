@@ -437,3 +437,96 @@ func TestCacheGroupLocalCopy(t *testing.T) {
 		})
 	}
 }
+
+// replicaStores starts one store per address in a cache group whose blocks each have replicas owners.
+func replicaStores(t *testing.T, storage object.ObjectStorage, peers string, addrs []string, replicas int) []ChunkStore {
+	t.Helper()
+	var stores []ChunkStore
+	for _, a := range addrs {
+		conf := defaultConf
+		conf.CacheDir = groupCacheDir(t)
+		conf.CacheSize = 100 << 20
+		conf.CacheFullBlock = true
+		conf.CacheGroupPeers = peers
+		conf.CacheGroupListen, conf.CacheGroupSelf = a, a
+		conf.CacheGroupTimeout = 2 * time.Second
+		conf.CacheGroupReplicas = replicas
+		stores = append(stores, NewCachedStore(storage, conf, nil))
+	}
+	return stores
+}
+
+func servedCount(g *cacheGroup) float64 {
+	total := 0.0
+	for _, src := range []string{"cache", "object"} {
+		m := &dto.Metric{}
+		_ = g.served.WithLabelValues(src).Write(m)
+		total += m.GetCounter().GetValue()
+	}
+	return total
+}
+
+func TestCacheGroupReplicasFetchOnceAndShareReads(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	storage := &countingStorage{ObjectStorage: mem}
+	const id, nBlocks = 23, 16
+	data := writeSlice(t, storage, id, nBlocks)
+	storage.gets.Store(0)
+	storage.delay = 20 * time.Millisecond
+
+	addrs := freeAddrs(t, 4)
+	stores := replicaStores(t, storage, strings.Join(addrs, ","), addrs, 2)
+	var wg sync.WaitGroup
+	for _, s := range stores {
+		for i := 0; i < nBlocks; i++ {
+			wg.Add(1)
+			go func(s ChunkStore, i int) {
+				defer wg.Done()
+				if got := readBlock(t, s, id, len(data), i); !bytes.Equal(got, data[i*defaultConf.BlockSize:(i+1)*defaultConf.BlockSize]) {
+					t.Errorf("block %d: wrong data", i)
+				}
+			}(s, i)
+		}
+	}
+	wg.Wait()
+	if got := storage.gets.Load(); got != nBlocks {
+		t.Fatalf("object storage GETs = %d, want %d (one per block across the group)", got, nBlocks)
+	}
+	// Both owners of a block serve readers: every member that owns some blocks as secondary served some of them.
+	for _, s := range stores {
+		g := s.(*cachedStore).cacheGroup
+		secondary := 0
+		for i := 0; i < nBlocks; i++ {
+			if o := g.owners(fmt.Sprintf("chunks/0/0/%d_%d_%d", id, i, defaultConf.BlockSize)); len(o) == 2 && o[1] == g.self {
+				secondary++
+			}
+		}
+		if secondary >= 3 && servedCount(g) == 0 {
+			t.Fatalf("%s is secondary owner of %d blocks but served none", g.self, secondary)
+		}
+	}
+}
+
+func TestCacheGroupReplicasSurviveADownOwner(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	storage := &countingStorage{ObjectStorage: mem}
+	const id, nBlocks = 29, 12
+	data := writeSlice(t, storage, id, nBlocks)
+	storage.gets.Store(0)
+
+	addrs := freeAddrs(t, 3) // the last member never starts, as if it were restarting
+	stores := replicaStores(t, storage, strings.Join(addrs, ","), addrs[:2], 2)
+	for round := 0; round < 2; round++ {
+		for _, s := range stores {
+			for i := 0; i < nBlocks; i++ {
+				if got := readBlock(t, s, id, len(data), i); !bytes.Equal(got, data[i*defaultConf.BlockSize:(i+1)*defaultConf.BlockSize]) {
+					t.Fatalf("block %d: wrong data", i)
+				}
+			}
+		}
+	}
+	// Every block has a live owner, so the group still reads each block from object storage once.
+	if got := storage.gets.Load(); got != nBlocks {
+		t.Fatalf("object storage GETs = %d, want %d", got, nBlocks)
+	}
+}

@@ -225,6 +225,11 @@ func dataCacheFlags() []cli.Flag {
 			Value: true,
 			Usage: "also cache blocks fetched from their cache group owner on this client; false caches each block once in the group, on its owner",
 		},
+		&cli.IntFlag{
+			Name:  "cache-group-replicas",
+			Value: 1,
+			Usage: "how many cache group members own each block; 2 survives one owner's restart and shares its reads",
+		},
 		&cli.StringFlag{
 			Name:  "cache-group-timeout",
 			Value: "5s",

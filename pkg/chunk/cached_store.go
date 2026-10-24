@@ -573,6 +573,9 @@ type Config struct {
 	// CacheGroupNoLocalCopy leaves a block fetched from its owner out of this member's cache, so each block is cached
 	// once in the group (on its owner) instead of on every member that reads it.
 	CacheGroupNoLocalCopy bool
+	// CacheGroupReplicas is how many members own each block (default 1). With 2, a block survives one owner's restart
+	// and its reads are shared by two owners, while object storage is still read about once per block.
+	CacheGroupReplicas int
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -808,15 +811,16 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 		if store.loadCached(key, page.Data) {
 			return nil
 		}
-		if fromPeer(ctx) || g.owner(key) == g.self {
-			// The group relies on the owner keeping its blocks, whatever cache-partial-only says.
+		if fromPeer(ctx) || g.isOwner(key) {
+			// The group relies on the owners keeping their blocks, whatever cache-partial-only says.
 			cache, forceCache = true, true
-		} else if err := g.fetch(ctx, key, page.Data); err == nil {
-			if cache && g.keepFetched() {
+		}
+		if err := g.fetch(ctx, key, page.Data); err == nil {
+			if cache && (g.keepFetched() || g.isOwner(key) || fromPeer(ctx)) {
 				store.bcache.cache(key, page, forceCache, !store.conf.OSCache)
 			}
 			return nil
-		} else {
+		} else if !errors.Is(err, errCacheGroupSelf) {
 			logger.Debugf("cache group: %s; reading %s from object storage", err, key)
 		}
 	}
