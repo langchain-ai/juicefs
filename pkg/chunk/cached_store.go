@@ -151,7 +151,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	s.store.cacheMiss.Add(1)
 	s.store.cacheMissBytes.Add(float64(len(p)))
 
-	if s.store.seekable &&
+	// A small read of a block another cache group member owns fetches the whole block from that member instead: the
+	// owner caches it for the group, and this client caches it too.
+	if s.store.seekable && !s.store.cacheGroup.remote(ctx, key) &&
 		(!s.store.conf.CacheEnabled() || (boff > 0 && len(p) <= blockSize/4)) {
 		n, err = s.store.loadRange(ctx, key, page, boff)
 		if err == nil || !errors.Is(err, errTryFullRead) {
@@ -558,6 +560,22 @@ type Config struct {
 	BufferSize             uint64
 	Readahead              int
 	Prefetch               int
+
+	// CacheGroupPeers lists the members of this client's cache group: comma-separated host:port addresses, or
+	// dns:<name>:<port> to resolve them (e.g. a headless Service). Empty disables the cache group.
+	CacheGroupPeers string
+	// CacheGroupListen is where this member serves blocks to others; empty joins the group without serving.
+	CacheGroupListen string
+	// CacheGroupSelf is the address other members know this one by; empty derives it from CacheGroupListen.
+	CacheGroupSelf string
+	// CacheGroupTimeout bounds one block request to an owner before falling back to object storage.
+	CacheGroupTimeout time.Duration
+	// CacheGroupNoLocalCopy leaves a block fetched from its owner out of this member's cache, so each block is cached
+	// once in the group (on its owner) instead of on every member that reads it.
+	CacheGroupNoLocalCopy bool
+	// CacheGroupReplicas is how many members own each block (default 1). With 2, a block survives one owner's restart
+	// and its reads are shared by two owners, while object storage is still read about once per block.
+	CacheGroupReplicas int
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -668,6 +686,7 @@ type cachedStore struct {
 	storage         object.ObjectStorage
 	bcache          CacheManager
 	fetcher         *prefetcher
+	cacheGroup      *cacheGroup
 	conf            Config
 	group           *Controller
 	currentUpload   chan struct{}
@@ -786,6 +805,25 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 			err = fmt.Errorf("recovered from %s", e)
 		}
 	}()
+	if g := store.cacheGroup; g != nil {
+		// Callers check the cache before joining a shared load, so a load that finished in between would otherwise be
+		// repeated; in a cache group many members race for the same block, so check again here.
+		if store.loadCached(key, page.Data) {
+			return nil
+		}
+		if fromPeer(ctx) || g.isOwner(key) {
+			// The group relies on the owners keeping their blocks, whatever cache-partial-only says.
+			cache, forceCache = true, true
+		}
+		if err := g.fetch(ctx, key, page.Data); err == nil {
+			if cache && (g.keepFetched() || g.isOwner(key) || fromPeer(ctx)) {
+				store.bcache.cache(key, page, forceCache, !store.conf.OSCache)
+			}
+			return nil
+		} else if !errors.Is(err, errCacheGroupSelf) {
+			logger.Debugf("cache group: %s; reading %s from object storage", err, key)
+		}
+	}
 	store.acquireSlot("GET", store.currentDownload)
 	defer func() { <-store.currentDownload }()
 	needed := store.compressor.CompressBound(len(page.Data))
@@ -920,6 +958,21 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		}
 	}()
 
+	if config.CacheGroupPeers != "" {
+		if !config.CacheEnabled() {
+			logger.Warnf("cache group needs a block cache (cache-size > 0); not joining %q", config.CacheGroupPeers)
+		} else if g, err := newCacheGroup(&config); err != nil {
+			logger.Errorf("cache group disabled: %s", err)
+		} else {
+			store.cacheGroup = g
+			if config.CacheGroupListen != "" {
+				if err := g.serve(store, config.CacheGroupListen); err != nil {
+					logger.Errorf("cache group: serve on %s: %s; fetching from members only", config.CacheGroupListen, err)
+				}
+			}
+		}
+	}
+
 	if !config.CacheEnabled() {
 		config.Prefetch = 0 // disable prefetch if cache is disabled
 	}
@@ -936,7 +989,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 			return p, err
 		})
 		defer block.Release()
-		if err == nil && block == p {
+		if err == nil && block == p && store.cacheGroup.keepsLocally(key) {
 			store.bcache.cache(key, block, true, !store.conf.OSCache)
 		}
 	})
@@ -1015,6 +1068,9 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	if reg == nil {
 		return
 	}
+	if store.cacheGroup != nil {
+		store.cacheGroup.register(reg)
+	}
 	reg.MustRegister(store.cacheHits)
 	reg.MustRegister(store.cacheHitBytes)
 	reg.MustRegister(store.cacheMiss)
@@ -1056,6 +1112,17 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 
 func (store *cachedStore) shouldCache(size int) bool {
 	return store.conf.CacheFullBlock || size < store.conf.BlockSize
+}
+
+// loadCached fills buf, the whole block, from the block cache and reports whether it could.
+func (store *cachedStore) loadCached(key string, buf []byte) bool {
+	r, err := store.bcache.load(key)
+	if err != nil {
+		return false
+	}
+	defer r.Close()
+	n, err := r.ReadAt(buf, 0)
+	return n == len(buf) && (err == nil || errors.Is(err, io.EOF))
 }
 
 func parseObjOrigSize(key string) int {
