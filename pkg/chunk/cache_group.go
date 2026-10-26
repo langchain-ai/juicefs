@@ -246,11 +246,6 @@ func (g *cacheGroup) owners(key string) []string {
 	return ranked[:min(max(g.replicas, 1), len(ranked))]
 }
 
-// owner returns key's primary owner.
-func (g *cacheGroup) owner(key string) string {
-	return g.owners(key)[0]
-}
-
 // isOwner reports whether this member is one of key's owners.
 func (g *cacheGroup) isOwner(key string) bool {
 	for _, m := range g.owners(key) {

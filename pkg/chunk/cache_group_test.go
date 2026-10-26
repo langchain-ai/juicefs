@@ -34,6 +34,11 @@ import (
 	dto "github.com/prometheus/client_model/go"
 )
 
+// owner returns key's primary owner.
+func (g *cacheGroup) owner(key string) string {
+	return g.owners(key)[0]
+}
+
 // countingStorage counts GETs and adds a fixed latency to each, standing in for a remote object store.
 type countingStorage struct {
 	object.ObjectStorage

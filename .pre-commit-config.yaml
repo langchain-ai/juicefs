@@ -10,3 +10,4 @@ repos:
     rev: v2.11.4
     hooks:
       - id: golangci-lint
+        language_version: '1.26.7'
