@@ -3,6 +3,7 @@ on:
   pull_request:
     branches:
       - 'main'
+      - 'langchain'
     paths:
       - '**/*_test.go'
 

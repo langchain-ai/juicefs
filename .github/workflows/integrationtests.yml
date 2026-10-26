@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 'main'
+      - 'langchain'
       - 'release-*'
     paths:
       - '**.c'
@@ -13,6 +14,7 @@ on:
   pull_request:
     branches:
       - 'main'
+      - 'langchain'
       - 'release-*'
     paths:
       - '**.c'
@@ -60,7 +62,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 1
-        
+
       - name: mount coverage dir
         timeout-minutes: 5
         uses: ./.github/actions/mount-coverage-dir
@@ -81,11 +83,11 @@ jobs:
 
       - name: Build
         uses: ./.github/actions/build
-        with: 
+        with:
           target: ${{steps.vars.outputs.target}}
 
       - name: Prepare meta db
-        run: | 
+        run: |
           chmod +x .github/scripts/start_meta_engine.sh
           source .github/scripts/start_meta_engine.sh
           start_meta_engine ${{matrix.meta}}
@@ -127,7 +129,7 @@ jobs:
           git clone https://github.com/billziss-gh/secfs.test.git
           make -C secfs.test tools tools/bin/fsx
           make -C secfs.test tools tools/bin/fsracer
-  
+
       - name: Fsx Test
         timeout-minutes: 16
         run: |
@@ -152,7 +154,7 @@ jobs:
             duration=300
           fi
           sudo secfs.test/tools/bin/fsracer $duration /jfs
-  
+
       - name: log
         if: always()
         run: |
@@ -192,5 +194,5 @@ jobs:
           workflow_name: ${{ github.workflow }}
 
       - name: Success
-        if: success() 
+        if: success()
         run: echo "All Done"

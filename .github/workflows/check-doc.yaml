@@ -2,7 +2,7 @@ name: Check document
 
 on:
   push:
-    branches: [main]
+    branches: [main, langchain]
     paths:
       - 'README*.md'
       - 'docs/**'
@@ -11,7 +11,7 @@ on:
       - '.markdownlint-cli2.jsonc'
       - '.github/workflows/check-doc.yaml'
   pull_request:
-    branches: [main]
+    branches: [main, langchain]
     paths:
       - 'README*.md'
       - 'docs/**'

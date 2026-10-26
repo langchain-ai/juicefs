@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 'main'
+      - 'langchain'
       - 'release-**'
     paths:
       - '**.go'
@@ -12,6 +13,7 @@ on:
   pull_request:
     branches:
       - 'main'
+      - 'langchain'
       - 'release-**'
     paths:
       - '**.go'
@@ -82,11 +84,11 @@ jobs:
 
       - name: Build
         uses: ./.github/actions/build
-        with: 
+        with:
           target: ${{steps.vars.outputs.target}}
 
       - name: Prepare meta db
-        run: | 
+        run: |
           chmod +x .github/scripts/start_meta_engine.sh
           source .github/scripts/start_meta_engine.sh
           start_meta_engine ${{matrix.meta}}
@@ -120,10 +122,10 @@ jobs:
           else
             TEST_DIR=/tmp/jfs/ python3 -m pytest tests
           fi
-          
+
       - name: log
         if: always()
-        run: | 
+        run: |
           if [ -f /var/log/juicefs.log ]; then
             tail -300 /var/log/juicefs.log
             grep "<FATAL>:" /var/log/juicefs.log && exit 1 || true
@@ -162,5 +164,5 @@ jobs:
           workflow_name: ${{ github.workflow }}
 
       - name: Success
-        if: success() 
+        if: success()
         run: echo "All Done"

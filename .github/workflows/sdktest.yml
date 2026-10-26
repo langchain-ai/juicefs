@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 'main'
+      - 'langchain'
       - 'release-*'
     paths-ignore:
       - '.autocorrectrc'
@@ -15,6 +16,7 @@ on:
     #The branches below must be a subset of the branches above
     branches:
       - 'main'
+      - 'langchain'
       - 'release-*'
     paths-ignore:
       - '.autocorrectrc'
@@ -92,7 +94,7 @@ jobs:
           sudo sh -c "echo "dev.keytab=`base64 /tmp/server.keytab -w 0`" >> /tmp/kerberos.cfg"
           sudo ../../juicefs config localhost --kerberos-config-file /tmp/kerberos.cfg -y
           sudo mvn test -B -Dtest=io.juicefs.kerberos.KerberosTest
-          
+
           sudo mvn package -B -Dmaven.test.skip=true --quiet -Dmaven.javadoc.skip=true
           expect=$(git rev-parse --short HEAD | cut -b 1-7)
           ls /tmp/libjfs* | grep $expect
