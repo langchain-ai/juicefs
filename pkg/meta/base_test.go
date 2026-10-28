@@ -207,6 +207,7 @@ func testMeta(t *testing.T, m Meta) {
 	testRenameDirStatWithTrash(t, m)
 	testClone(t, m)
 	testBatchClone(t, m)
+	testZeroChunks(t, m)
 	testACL(t, m)
 	testKerberosToken(t, m)
 	base.conf.ReadOnly = true

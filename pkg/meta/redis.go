@@ -1296,18 +1296,18 @@ func (m *redisMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uint6
 		t.Ctimensec = uint32(now.Nanosecond())
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.Set(ctx, m.inodeKey(inode), m.marshal(&t), 0)
-			// zero out from left to right
+			// zero out from left to right; a missing chunk already reads as zeros
 			var l = uint32(right - left)
 			if right > (left/ChunkSize+1)*ChunkSize {
 				l = ChunkSize - uint32(left%ChunkSize)
 			}
-			pipe.RPush(ctx, m.chunkKey(inode, uint32(left/ChunkSize)), marshalSlice(uint32(left%ChunkSize), 0, 0, 0, l))
+			pipe.RPushX(ctx, m.chunkKey(inode, uint32(left/ChunkSize)), marshalSlice(uint32(left%ChunkSize), 0, 0, 0, l))
 			buf := marshalSlice(0, 0, 0, 0, ChunkSize)
 			for _, indx := range zeroChunks {
 				pipe.RPushX(ctx, m.chunkKey(inode, indx), buf)
 			}
 			if right > (left/ChunkSize+1)*ChunkSize && right%ChunkSize > 0 {
-				pipe.RPush(ctx, m.chunkKey(inode, uint32(right/ChunkSize)), marshalSlice(0, 0, 0, 0, uint32(right%ChunkSize)))
+				pipe.RPushX(ctx, m.chunkKey(inode, uint32(right/ChunkSize)), marshalSlice(0, 0, 0, 0, uint32(right%ChunkSize)))
 			}
 			pipe.IncrBy(ctx, m.usedSpaceKey(), delta.space)
 			m.genLog(ctx, pipe, now, "TRUNCATE(%d,%d,%d,%d)", inode, oldLength, length, flags)
@@ -1374,7 +1374,8 @@ func (m *redisMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64, 
 					if coff+size > ChunkSize {
 						l = ChunkSize - coff
 					}
-					pipe.RPush(ctx, m.chunkKey(inode, indx), marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
+					// a missing chunk already reads as zeros
+					pipe.RPushX(ctx, m.chunkKey(inode, indx), marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
 					off += l
 					size -= l
 				}
@@ -5460,6 +5461,9 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 						if ss == nil {
 							return syscall.EIO
 						}
+						if zeroOnly(ss) {
+							continue
+						}
 						p.RPush(ctx, m.chunkKey(ino, uint32(i)), sv)
 						for _, s := range ss {
 							if s.id > 0 {
@@ -5677,6 +5681,9 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				ss := readSlices(val)
 				if ss == nil {
 					return syscall.EIO
+				}
+				if zeroOnly(ss) {
+					continue
 				}
 				sd.chunks[c.indx] = chunkData{vals: val, slices: ss}
 			}

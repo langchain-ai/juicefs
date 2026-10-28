@@ -1551,6 +1551,15 @@ func (m *dbMeta) doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmode ui
 }
 
 func (m *dbMeta) appendSlice(s *xorm.Session, inode Ino, indx uint32, buf []byte) error {
+	ok, err := m.appendSliceIfExists(s, inode, indx, buf)
+	if err == nil && !ok {
+		err = mustInsert(s, &chunk{Inode: inode, Indx: indx, Slices: buf})
+	}
+	return err
+}
+
+// appendSliceIfExists appends buf to the chunk only if the chunk exists, and reports whether it did.
+func (m *dbMeta) appendSliceIfExists(s *xorm.Session, inode Ino, indx uint32, buf []byte) (bool, error) {
 	var r sql.Result
 	var err error
 	driver := m.Name()
@@ -1559,12 +1568,11 @@ func (m *dbMeta) appendSlice(s *xorm.Session, inode Ino, indx uint32, buf []byte
 	} else {
 		r, err = s.Exec(m.sqlConv("update chunk set slices=concat(slices, ?) where inode=? AND indx=?"), buf, inode, indx)
 	}
-	if err == nil {
-		if n, _ := r.RowsAffected(); n == 0 {
-			err = mustInsert(s, &chunk{Inode: inode, Indx: indx, Slices: buf})
-		}
+	if err != nil {
+		return false, err
 	}
-	return err
+	n, _ := r.RowsAffected()
+	return n > 0, nil
 }
 
 func (m *dbMeta) upsertSlice(s *xorm.Session, inode Ino, indx uint32, buf []byte, insert *bool) error {
@@ -1632,11 +1640,12 @@ func (m *dbMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uint64, 
 			}
 		}
 
+		// a missing chunk already reads as zeros
 		l := uint32(right - left)
 		if right > (left/ChunkSize+1)*ChunkSize {
 			l = ChunkSize - uint32(left%ChunkSize)
 		}
-		if err = m.appendSlice(s, inode, uint32(left/ChunkSize), marshalSlice(uint32(left%ChunkSize), 0, 0, 0, l)); err != nil {
+		if _, err = m.appendSliceIfExists(s, inode, uint32(left/ChunkSize), marshalSlice(uint32(left%ChunkSize), 0, 0, 0, l)); err != nil {
 			return err
 		}
 		buf := marshalSlice(0, 0, 0, 0, ChunkSize)
@@ -1646,7 +1655,7 @@ func (m *dbMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uint64, 
 			}
 		}
 		if right > (left/ChunkSize+1)*ChunkSize && right%ChunkSize > 0 {
-			if err = m.appendSlice(s, inode, uint32(right/ChunkSize), marshalSlice(0, 0, 0, 0, uint32(right%ChunkSize))); err != nil {
+			if _, err = m.appendSliceIfExists(s, inode, uint32(right/ChunkSize), marshalSlice(0, 0, 0, 0, uint32(right%ChunkSize))); err != nil {
 				return err
 			}
 		}
@@ -1721,7 +1730,8 @@ func (m *dbMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64, siz
 				if coff+size > ChunkSize {
 					l = ChunkSize - coff
 				}
-				err = m.appendSlice(s, inode, indx, marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
+				// a missing chunk already reads as zeros
+				_, err = m.appendSliceIfExists(s, inode, indx, marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
 				if err != nil {
 					return err
 				}
@@ -5432,10 +5442,16 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 				if err = s.Where("inode = ?", srcIno).ForUpdate().Find(&cs); err != nil {
 					return err
 				}
-				for i := range cs {
-					cs[i].Id = 0
-					cs[i].Inode = ino
+				kept := cs[:0]
+				for _, c := range cs {
+					if ss := readSliceBuf(c.Slices); ss != nil && zeroOnly(ss) {
+						continue
+					}
+					c.Id = 0
+					c.Inode = ino
+					kept = append(kept, c)
 				}
+				cs = kept
 				if len(cs) != 0 {
 					if err := mustInsert(s, cs); err != nil {
 						return err
@@ -5602,6 +5618,9 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			}
 			chunksByInode := make(map[Ino][]chunk, len(fileInodes))
 			for _, c := range srcChunks {
+				if ss := readSliceBuf(c.Slices); ss != nil && zeroOnly(ss) {
+					continue
+				}
 				chunksByInode[c.Inode] = append(chunksByInode[c.Inode], c)
 			}
 			chunksIns := make([]interface{}, 0, len(srcChunks))

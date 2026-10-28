@@ -86,6 +86,13 @@ type kvTxn struct {
 	retry int
 }
 
+// appendIfExists appends value to key only if the key exists.
+func (tx *kvTxn) appendIfExists(key []byte, value []byte) {
+	if tx.get(key) != nil {
+		tx.append(key, value)
+	}
+}
+
 func (tx *kvTxn) deleteKeys(prefix []byte) {
 	tx.scan(prefix, nextKey(prefix), true, func(k, v []byte) bool {
 		tx.delete(k)
@@ -1307,13 +1314,14 @@ func (m *kvMeta) doTruncate(ctx Context, inode Ino, flags uint8, length uint64, 
 					return true
 				})
 		}
+		// a missing chunk already reads as zeros
 		l := uint32(right - left)
 		if right > (left/ChunkSize+1)*ChunkSize {
 			l = ChunkSize - uint32(left%ChunkSize)
 		}
-		tx.append(m.chunkKey(inode, uint32(left/ChunkSize)), marshalSlice(uint32(left%ChunkSize), 0, 0, 0, l))
+		tx.appendIfExists(m.chunkKey(inode, uint32(left/ChunkSize)), marshalSlice(uint32(left%ChunkSize), 0, 0, 0, l))
 		if right > (left/ChunkSize+1)*ChunkSize && right%ChunkSize > 0 {
-			tx.append(m.chunkKey(inode, uint32(right/ChunkSize)), marshalSlice(0, 0, 0, 0, uint32(right%ChunkSize)))
+			tx.appendIfExists(m.chunkKey(inode, uint32(right/ChunkSize)), marshalSlice(0, 0, 0, 0, uint32(right%ChunkSize)))
 		}
 		oldLength := t.Length
 		t.Length = length
@@ -1382,7 +1390,8 @@ func (m *kvMeta) doFallocate(ctx Context, inode Ino, mode uint8, off uint64, siz
 				if coff+size > ChunkSize {
 					l = ChunkSize - coff
 				}
-				tx.append(m.chunkKey(inode, indx), marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
+				// a missing chunk already reads as zeros
+				tx.appendIfExists(m.chunkKey(inode, indx), marshalSlice(uint32(coff), 0, 0, 0, uint32(l)))
 				off += l
 				size -= l
 			}
@@ -4493,8 +4502,11 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 				refKeys := make([][]byte, 0, len(vals))
 				for indx := uint32(0); indx <= uint32(attr.Length/ChunkSize); indx++ {
 					if v, ok := vals[string(m.chunkKey(srcIno, indx))]; ok {
-						tx.set(m.chunkKey(ino, indx), v)
 						ss := readSliceBuf(v)
+						if ss != nil && zeroOnly(ss) {
+							continue
+						}
+						tx.set(m.chunkKey(ino, indx), v)
 						for _, s := range ss {
 							if s.id > 0 {
 								refKeys = append(refKeys, m.sliceKey(s.id, s.size))
@@ -4704,8 +4716,12 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 				false, func(k, v []byte) bool {
 					// extract chunk index from key
 					indx := binary.BigEndian.Uint32(k[len(k)-4:])
+					ss := readSliceBuf(v)
+					if ss != nil && zeroOnly(ss) {
+						return true
+					}
 					tx.set(m.chunkKey(fc.dstIno, indx), v)
-					for _, s := range readSliceBuf(v) {
+					for _, s := range ss {
 						if s.id > 0 {
 							refCounts[string(m.sliceKey(s.id, s.size))]++
 						}

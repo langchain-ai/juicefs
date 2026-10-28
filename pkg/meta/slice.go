@@ -131,6 +131,17 @@ func readSliceBuf(buf []byte) []*slice {
 	return ss
 }
 
+// zeroOnly reports whether ss holds hole (id 0) records only. Such a chunk reads as zeros, the
+// same as a chunk with no records, so it does not need to be stored.
+func zeroOnly(ss []*slice) bool {
+	for _, s := range ss {
+		if s.id > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func buildSlice(ss []*slice) []Slice {
 	var root *slice
 	for i := range ss {
