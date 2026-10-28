@@ -113,6 +113,50 @@ func TestConfigHashPrefixFromSlice(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestConfigHashPrefixFromSliceRecheck lets clients take slice ids while config waits at its confirmation prompt, and
+// checks that config refuses to write a threshold that has become too close.
+func TestConfigHashPrefixFromSliceRecheck(t *testing.T) {
+	dir := t.TempDir()
+	metaURL := "sqlite3://" + filepath.Join(dir, "meta.db")
+	hpFormat(t, metaURL, filepath.Join(dir, "bucket"))
+	m := meta.NewClient(metaURL, nil)
+	_, err := m.Load(true)
+	require.NoError(t, err)
+	next, err := meta.NextSliceID(m)
+	require.NoError(t, err)
+	from := next + hashPrefixMinMargin
+
+	inR, inW, err := os.Pipe()
+	require.NoError(t, err)
+	outR, outW, err := os.Pipe()
+	require.NoError(t, err)
+	stdin, stdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = inR, outW
+	defer func() { os.Stdin, os.Stdout = stdin, stdout }()
+	done := make(chan error, 1)
+	go func() { done <- Main([]string{"", "config", metaURL, "--hash-prefix-from-slice", u64(from)}) }()
+
+	// The first check passed once config asks for confirmation.
+	var out []byte
+	buf := make([]byte, 512)
+	for !bytes.Contains(out, []byte("Proceed anyway?")) {
+		n, err := outR.Read(buf)
+		require.NoError(t, err)
+		out = append(out, buf[:n]...)
+	}
+	for id := uint64(0); id < next+meta.SliceIDBatch; {
+		require.Zero(t, m.NewSlice(hpCtx, &id))
+	}
+	_, err = inW.WriteString("y\n")
+	require.NoError(t, err)
+	require.ErrorContains(t, <-done, "is too close to the next slice id")
+
+	format, err := m.Load(false)
+	require.NoError(t, err)
+	require.Zero(t, format.HashPrefixFromSlice)
+	require.Equal(t, "1.1.0-A", format.MinClientVersion)
+}
+
 func TestConfigHashPrefixFromSliceOnHashPrefixVolume(t *testing.T) {
 	dir := t.TempDir()
 	metaURL := "sqlite3://" + filepath.Join(dir, "meta.db")

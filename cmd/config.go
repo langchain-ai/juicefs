@@ -159,7 +159,8 @@ const hashPrefixMinMargin uint64 = 1 << 20
 // checkHashPrefixFromSlice refuses a hash-prefix threshold that some client could miss: one that is already set,
 // one that a client older than hashPrefixFromSliceMinClient could cross, or one so close to the next slice id that a
 // client could be handed an id at or above it before it reloads the format. A client that misses the threshold stores
-// slices under keys that the others do not read, so these checks are not skipped by --force.
+// slices under keys that the others do not read, so these checks are not skipped by --force. Clients without a
+// recorded session (gc, jfs:// sync, the Java SDK with NoSession) are not listed, so it cannot see old ones of those.
 func checkHashPrefixFromSlice(m meta.Meta, format *meta.Format, from uint64) error {
 	if format.HashPrefix {
 		return fmt.Errorf("volume %s was formatted with --hash-prefix: every slice already uses hash-prefixed keys", format.Name)
@@ -532,7 +533,8 @@ func config(ctx *cli.Context) error {
 			}
 		}
 		if hashFrom {
-			warn("Slices from id %d on will be stored under hash-prefixed object keys. This cannot be undone: the threshold cannot be changed later, and clients below %s will no longer mount the volume.",
+			warn("Slices from id %d on will be stored under hash-prefixed object keys. This cannot be undone: the threshold cannot be changed later, and clients below %s will no longer mount the volume. "+
+				"Clients that run without a session (juicefs gc, juicefs sync with jfs://, the Java SDK with NoSession) are not checked: stop or upgrade older ones first.",
 				format.HashPrefixFromSlice, hashPrefixFromSliceMinClient)
 			if !yes && !userConfirmed() {
 				return fmt.Errorf("Aborted.")
@@ -599,6 +601,17 @@ func config(ctx *cli.Context) error {
 		}
 	}
 
+	if hashFrom {
+		// The prompts above can wait for any time while clients keep taking slice ids and connecting: check again
+		// against the stored format right before writing.
+		cur, err := m.Load(false)
+		if err != nil {
+			return err
+		}
+		if err = checkHashPrefixFromSlice(m, cur, format.HashPrefixFromSlice); err != nil {
+			return err
+		}
+	}
 	if encrypted || ctx.Bool("encrypt-secret") {
 		if err = format.Encrypt(); err != nil {
 			logger.Fatalf("Format encrypt: %s", err)
