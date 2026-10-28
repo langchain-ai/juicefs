@@ -850,12 +850,14 @@ Currently there are two hash algorithms, and both use the sliceId in basename as
 
 ```go
 func hash(sliceId int) string {
-    if HashPrefix {
+    if HashPrefix || HashPrefixFromSlice > 0 && sliceId >= HashPrefixFromSlice {
         return fmt.Sprintf("%02X/%d", sliceId%256, sliceId/1000/1000)
     }
     return fmt.Sprintf("%d/%d", sliceId/1000/1000, sliceId/1000)
 }
 ```
+
+`HashPrefixFromSlice` (set once with `juicefs config --hash-prefix-from-slice`) turns on the hashed names for new slices of a volume formatted without HashPrefix; slices below it keep their names.
 
 Suppose a file system named `jfstest` is written with a continuous 10 MiB of data and internally given a SliceID of 1 with HashPrefix disabled, then the following three objects will be generated in the object storage.
 

@@ -17,6 +17,7 @@
 package meta
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -89,4 +90,57 @@ func TestFormat_Update_KeyConflict(t *testing.T) {
 	}
 
 	assert.Equal(t, "secret", newFormat.SecretKey)
+}
+
+func TestFormatUpdateHashPrefixFromSlice(t *testing.T) {
+	unset := Format{Name: "test", UUID: "UUID"}
+	set := Format{Name: "test", UUID: "UUID", HashPrefixFromSlice: 2000}
+
+	f := set
+	assert.NoError(t, f.update(&unset, false), "setting it the first time")
+	f = set
+	assert.NoError(t, f.update(&set, false), "keeping it")
+	for _, v := range []uint64{0, 1999, 2001} {
+		f := Format{Name: "test", UUID: "UUID", HashPrefixFromSlice: v}
+		assert.ErrorContains(t, f.update(&set, false), "hash prefix from slice", "changing it to %d", v)
+		assert.NoError(t, f.update(&set, true), "forcing it to %d", v)
+	}
+}
+
+func TestNextSliceID(t *testing.T) {
+	// Two clients on one database (memkv gives each client its own store); the Redis rule is covered in cmd.
+	for name, url := range map[string]string{
+		"sqlite3": "sqlite3://" + filepath.Join(t.TempDir(), "next-slice-id.db"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := NewClient(url, nil)
+			if err := m.Init(testFormat(), true); err != nil {
+				t.Fatalf("initialize failed: %s", err)
+			}
+			defer m.Shutdown()
+			if _, err := m.Load(true); err != nil {
+				t.Fatalf("load: %s", err)
+			}
+			var first uint64
+			if st := m.NewSlice(Background(), &first); st != 0 {
+				t.Fatalf("new slice: %s", st)
+			}
+			next, err := NextSliceID(m)
+			assert.NoError(t, err)
+			// The client holds the whole batch that starts at first, and none of it may reach next.
+			assert.Greater(t, next, first+SliceIDBatch-1)
+
+			// The next batch starts at next (Redis) or one below it (SQL, TKV).
+			m2 := NewClient(url, nil)
+			defer m2.Shutdown()
+			if _, err := m2.Load(true); err != nil {
+				t.Fatalf("load: %s", err)
+			}
+			var second uint64
+			if st := m2.NewSlice(Background(), &second); st != 0 {
+				t.Fatalf("new slice: %s", st)
+			}
+			assert.GreaterOrEqual(t, second+1, next)
+		})
+	}
 }

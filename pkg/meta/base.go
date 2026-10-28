@@ -2185,6 +2185,20 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 	return 0
 }
 
+// SliceIDBatch is how many slice ids a client takes from the nextChunk counter at a time.
+const SliceIDBatch = sliceIdBatch
+
+// NextSliceID returns a slice id that no client has been handed yet: NewSlice takes ids in batches from the nextChunk
+// counter, so every id handed out so far is below it. Redis keeps that counter one below SQL and TKV; the +1 is exact
+// there and one too high elsewhere, which only makes a margin above it larger.
+func NextSliceID(m Meta) (uint64, error) {
+	v, err := m.getBase().en.getCounter("nextChunk")
+	if err != nil {
+		return 0, err
+	}
+	return uint64(v) + 1, nil
+}
+
 func (m *baseMeta) NewSlice(ctx Context, id *uint64) syscall.Errno {
 	m.freeMu.Lock()
 	defer m.freeMu.Unlock()

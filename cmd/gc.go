@@ -99,6 +99,9 @@ func gc(ctx *cli.Context) error {
 	}
 	logger.Infof("Data use %s", blob)
 	store := chunk.NewCachedStore(blob, chunkConf, nil)
+	m.OnReload(func(fmt *meta.Format) {
+		store.SetHashPrefixFromSlice(fmt.HashPrefixFromSlice)
+	})
 
 	// Scan all chunks first and do compaction if necessary
 	progress := utils.NewProgress(false)

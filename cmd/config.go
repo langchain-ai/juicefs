@@ -55,7 +55,10 @@ $ juicefs config redis://localhost --inodes 10000000 --capacity 1048576
 $ juicefs config redis://localhost --trash-days 7
 
 # Limit client version that is allowed to connect
-$ juicefs config redis://localhost --min-client-version 1.0.0 --max-client-version 1.1.0`,
+$ juicefs config redis://localhost --min-client-version 1.0.0 --max-client-version 1.1.0
+
+# Store slices from id 2000000000 on under hash-prefixed object keys (once; it cannot be undone)
+$ juicefs config redis://localhost --hash-prefix-from-slice 2000000000`,
 		Flags: expandFlags(
 			formatStorageFlags(),
 			addCategories("DATA STORAGE", []cli.Flag{
@@ -66,6 +69,10 @@ $ juicefs config redis://localhost --min-client-version 1.0.0 --max-client-versi
 				&cli.StringFlag{
 					Name:  "download-limit",
 					Usage: "default bandwidth limit of a client for download in Mbps",
+				},
+				&cli.Uint64Flag{
+					Name:  "hash-prefix-from-slice",
+					Usage: "store slices with id >= this under hash-prefixed object keys, on a volume formatted without --hash-prefix; it can be set only once and requires clients >= " + hashPrefixFromSliceMinClient,
 				},
 			}),
 			formatManagementFlags(),
@@ -140,6 +147,51 @@ func configFlags() []cli.Flag {
 	}
 }
 
+// hashPrefixFromSliceMinClient is the oldest client version that knows HashPrefixFromSlice. An older client would read
+// and write the slices from the threshold on under their sequential keys.
+const hashPrefixFromSliceMinClient = "1.4.2-A"
+
+// hashPrefixMinMargin is the smallest distance from the next slice id to a new hash-prefix threshold, on top of two
+// id batches per session. Clients learn the threshold on their next format reload (every heartbeat, 12s by default),
+// and none may be handed an id at or above it before then. About 1M ids is ten minutes at 1,700 new ids per second.
+const hashPrefixMinMargin uint64 = 1 << 20
+
+// checkHashPrefixFromSlice refuses a hash-prefix threshold that some client could miss: one that is already set,
+// one that a client older than hashPrefixFromSliceMinClient could cross, or one so close to the next slice id that a
+// client could be handed an id at or above it before it reloads the format. A client that misses the threshold stores
+// slices under keys that the others do not read, so these checks are not skipped by --force.
+func checkHashPrefixFromSlice(m meta.Meta, format *meta.Format, from uint64) error {
+	if format.HashPrefix {
+		return fmt.Errorf("volume %s was formatted with --hash-prefix: every slice already uses hash-prefixed keys", format.Name)
+	}
+	if format.HashPrefixFromSlice != 0 {
+		return fmt.Errorf("hash-prefix-from-slice is %d and cannot be changed: the slices from that id on are stored under hash-prefixed keys", format.HashPrefixFromSlice)
+	}
+	sessions, err := m.ListSessions()
+	if err != nil {
+		return fmt.Errorf("list sessions: %s", err)
+	}
+	gate := meta.Format{MinClientVersion: hashPrefixFromSliceMinClient}
+	var old []string
+	for _, s := range sessions {
+		if gate.CheckCliVersion(version.Parse(s.Version)) != nil {
+			old = append(old, fmt.Sprintf("session %d (host %s, pid %d, version %s)", s.Sid, s.HostName, s.ProcessID, s.Version))
+		}
+	}
+	if len(old) > 0 {
+		return fmt.Errorf("clients older than %s are connected and would keep sequential keys for new slices; upgrade or stop them first: %s", hashPrefixFromSliceMinClient, strings.Join(old, ", "))
+	}
+	next, err := meta.NextSliceID(m)
+	if err != nil {
+		return fmt.Errorf("read the next slice id: %s", err)
+	}
+	margin := hashPrefixMinMargin + uint64(len(sessions))*2*meta.SliceIDBatch
+	if from < next+margin {
+		return fmt.Errorf("hash-prefix-from-slice %d is too close to the next slice id %d: use at least %d (a margin of %d ids gives every client time to reload the format first)", from, next, next+margin, margin)
+	}
+	return nil
+}
+
 func warn(format string, a ...interface{}) {
 	fmt.Printf("\033[1;33mWARNING\033[0m: "+format+"\n", a...)
 }
@@ -175,7 +227,7 @@ func config(ctx *cli.Context) error {
 
 	originDirStats := format.DirStats
 	originUGQuota := format.UserGroupQuota
-	var quota, storage, trash, clientVer, tier bool
+	var quota, storage, trash, clientVer, tier, hashFrom bool
 	var msg strings.Builder
 	encrypted := format.KeyEncrypted
 	var targetTierID uint8
@@ -294,6 +346,16 @@ func config(ctx *cli.Context) error {
 			if new := utils.ParseMbps(ctx, flag); new != format.DownloadLimit {
 				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, utils.Mbps(format.DownloadLimit), utils.Mbps(new)))
 				format.DownloadLimit = new
+			}
+		case "hash-prefix-from-slice":
+			if new := ctx.Uint64(flag); new != format.HashPrefixFromSlice {
+				if err := checkHashPrefixFromSlice(m, format, new); err != nil {
+					return err
+				}
+				msg.WriteString(fmt.Sprintf("%s: %d -> %d\n", flag, format.HashPrefixFromSlice, new))
+				format.HashPrefixFromSlice = new
+				requireMinClientVersion(hashPrefixFromSliceMinClient)
+				hashFrom = true
 			}
 		case "trash-days":
 			if new := ctx.Int(flag); new != format.TrashDays {
@@ -467,6 +529,13 @@ func config(ctx *cli.Context) error {
 				if !yes && !userConfirmed() {
 					return fmt.Errorf("Aborted.")
 				}
+			}
+		}
+		if hashFrom {
+			warn("Slices from id %d on will be stored under hash-prefixed object keys. This cannot be undone: the threshold cannot be changed later, and clients below %s will no longer mount the volume.",
+				format.HashPrefixFromSlice, hashPrefixFromSliceMinClient)
+			if !yes && !userConfirmed() {
+				return fmt.Errorf("Aborted.")
 			}
 		}
 		if trash && format.TrashDays == 0 {

@@ -223,6 +223,9 @@ func initForMdtest(c *cli.Context, mp string, metaUrl string) *fs.FileSystem {
 	if err != nil {
 		logger.Fatalf("new session: %s", err)
 	}
+	m.OnReload(func(fmt *meta.Format) {
+		store.SetHashPrefixFromSlice(fmt.HashPrefixFromSlice)
+	})
 
 	conf := getVfsConf(c, metaConf, format, chunkConf)
 	conf.AccessLog = c.String("access-log")

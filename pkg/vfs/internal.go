@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -226,12 +227,7 @@ func CalcObjects(format meta.Format, id uint64, size, offset, length uint32) []*
 		return nil
 	}
 	bsize := uint32(format.BlockSize * 1024)
-	var prefix string
-	if format.HashPrefix {
-		prefix = fmt.Sprintf("%s/chunks/%02X/%v/%v", format.Name, id%256, id/1000/1000, id)
-	} else {
-		prefix = fmt.Sprintf("%s/chunks/%v/%v/%v", format.Name, id/1000/1000, id/1000, id)
-	}
+	prefix := format.Name + "/" + chunk.SliceKeyPrefix(id, format.HashPrefix, format.HashPrefixFromSlice)
 	first := offset / bsize
 	last := (offset + length - 1) / bsize
 	objs := make([]*Obj, 0, last-first+1)
@@ -400,6 +396,7 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 			} else {
 				fmt.Fprintf(w, "objects:\n")
 			}
+			format := v.Meta.GetFormat() // v.Conf.Format is not refreshed on format reloads
 			for indx := uint64(0); indx*meta.ChunkSize < summary.Length; indx++ {
 				var cs []meta.Slice
 				_ = v.Meta.Read(ctx, inode, uint32(indx), &cs)
@@ -407,7 +404,7 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 					if raw {
 						fmt.Fprintf(w, "\t%d:\t%d\t%d\t%d\t%d\n", indx, c.Id, c.Size, c.Off, c.Len)
 					} else {
-						for _, o := range CalcObjects(v.Conf.Format, c.Id, c.Size, c.Off, c.Len) {
+						for _, o := range CalcObjects(format, c.Id, c.Size, c.Off, c.Len) {
 							fmt.Fprintf(w, "\t%d:\t%s\t%d\t%d\t%d\n", indx, o.Key, o.Size, o.Off, o.Len)
 						}
 					}
@@ -467,6 +464,7 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 			}
 			info.Paths = v.Meta.GetPaths(ctx, inode)
 			if info.Summary.Files == 1 && info.Summary.Dirs == 0 {
+				format := v.Meta.GetFormat() // v.Conf.Format is not refreshed on format reloads
 				for indx := uint64(0); indx*meta.ChunkSize < info.Summary.Length; indx++ {
 					var cs []meta.Slice
 					_ = v.Meta.Read(ctx, inode, uint32(indx), &cs)
@@ -474,7 +472,7 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 						if raw {
 							info.Chunks = append(info.Chunks, &chunkSlice{indx, c})
 						} else {
-							for _, o := range CalcObjects(v.Conf.Format, c.Id, c.Size, c.Off, c.Len) {
+							for _, o := range CalcObjects(format, c.Id, c.Size, c.Off, c.Len) {
 								info.Objects = append(info.Objects, &chunkObj{indx, o.Key, o.Size, o.Off, o.Len})
 							}
 						}

@@ -375,9 +375,10 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		cm = 0600
 	}
 	chunkConf := &chunk.Config{
-		BlockSize:  format.BlockSize * 1024,
-		Compress:   format.Compression,
-		HashPrefix: format.HashPrefix,
+		BlockSize:           format.BlockSize * 1024,
+		Compress:            format.Compression,
+		HashPrefix:          format.HashPrefix,
+		HashPrefixFromSlice: format.HashPrefixFromSlice,
 
 		GetTimeout:             utils.Duration(c.String("get-timeout")),
 		PutTimeout:             utils.Duration(c.String("put-timeout")),
@@ -693,6 +694,7 @@ func mount(c *cli.Context) error {
 	metaCli.OnReload(func(fmt *meta.Format) {
 		updateFormat(c)(fmt)
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
+		store.SetHashPrefixFromSlice(fmt.HashPrefixFromSlice)
 	})
 	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
 	installHandler(metaCli, mp, v, blob)
