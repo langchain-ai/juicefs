@@ -68,13 +68,17 @@ $ juicefs info -i 100`,
 				Name:  "raw",
 				Usage: "show internal raw information",
 			},
+			&cli.BoolFlag{
+				Name:  "objects-only",
+				Usage: "show a file's chunks or objects without looking up its paths, storage class or locks (looking up the paths of a file with many hard links lists every ancestor directory of each link)",
+			},
 		},
 	}
 }
 
 func info(ctx *cli.Context) error {
 	setup0(ctx, 1, 0)
-	var recursive, strict, raw uint8
+	var recursive, strict, raw, objectsOnly uint8
 	if ctx.Bool("recursive") {
 		recursive = 1
 	}
@@ -83,6 +87,9 @@ func info(ctx *cli.Context) error {
 	}
 	if ctx.Bool("raw") {
 		raw = 1
+	}
+	if ctx.Bool("objects-only") {
+		objectsOnly = 1
 	}
 	for i := 0; i < ctx.Args().Len(); i++ {
 		progress := utils.NewProgress(recursive == 0) // only show progress for recursive info
@@ -114,13 +121,14 @@ func info(ctx *cli.Context) error {
 			continue
 		}
 
-		wb := utils.NewBuffer(8 + 11)
+		wb := utils.NewBuffer(8 + 12)
 		wb.Put32(meta.InfoV2)
-		wb.Put32(11)
+		wb.Put32(12)
 		wb.Put64(inode)
 		wb.Put8(recursive)
 		wb.Put8(raw)
 		wb.Put8(strict)
+		wb.Put8(objectsOnly)
 		_, err = f.Write(wb.Bytes())
 		if err != nil {
 			logger.Fatalf("write message: %s", err)
@@ -152,10 +160,11 @@ func info(ctx *cli.Context) error {
 		fmt.Printf("   dirs: %d\n", resp.Summary.Dirs)
 		fmt.Printf(" length: %s\n", utils.FormatBytes(resp.Summary.Length))
 		fmt.Printf("   size: %s\n", utils.FormatBytes(resp.Summary.Size))
-		switch len(resp.Paths) {
-		case 0:
+		switch {
+		case objectsOnly == 1:
+		case len(resp.Paths) == 0:
 			fmt.Printf("   path: %s\n", "unknown")
-		case 1:
+		case len(resp.Paths) == 1:
 			fmt.Printf("   path: %s\n", resp.Paths[0])
 		default:
 			fmt.Printf("  paths:\n")

@@ -837,6 +837,42 @@ func TestInternalFile(t *testing.T) {
 	if infoResp.Failed && infoResp.Reason != "" {
 		t.Fatalf("info v2 result: %s", infoResp.Reason)
 	}
+	if len(infoResp.Paths) == 0 {
+		t.Fatalf("info v2 should look up paths by default")
+	}
+
+	// info v2, objects only: recursive, raw, strict, objectsOnly
+	buf = make([]byte, 4+4+8+4)
+	w = utils.FromBuffer(buf)
+	w.Put32(meta.InfoV2)
+	w.Put32(12)
+	w.Put64(1)
+	w.Put8(1)
+	w.Put8(0)
+	w.Put8(0)
+	w.Put8(1)
+	if e := v.Write(ctx, fe.Inode, w.Bytes(), off, fh); e != 0 {
+		t.Fatalf("write info v2 objects only: %s", e)
+	}
+	off += uint64(len(buf))
+	buf = make([]byte, 1024*10)
+	data, e = readData(buf, &off)
+	if e != 0 {
+		t.Fatalf("read info v2 objects only: %s", e)
+	}
+	var objectsOnlyResp InfoResponse
+	if e := json.Unmarshal(data, &objectsOnlyResp); e != nil {
+		t.Fatalf("unmarshal info v2 objects only: %s", e)
+	}
+	if objectsOnlyResp.Failed {
+		t.Fatalf("info v2 objects only result: %s", objectsOnlyResp.Reason)
+	}
+	if len(objectsOnlyResp.Paths) != 0 {
+		t.Fatalf("info v2 objects only should not look up paths, got %v", objectsOnlyResp.Paths)
+	}
+	if objectsOnlyResp.Summary != infoResp.Summary {
+		t.Fatalf("info v2 objects only summary %+v, want %+v", objectsOnlyResp.Summary, infoResp.Summary)
+	}
 
 	// fill
 	buf = make([]byte, 4+4+8+1+1+2+1)

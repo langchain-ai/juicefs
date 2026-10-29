@@ -576,6 +576,7 @@ juicefs info -i 100
 |`--recursive, -r`|递归获取所有子目录的概要信息，当指定一个目录结构很复杂的路径时可能会耗时很长） (默认：false)|
 |`--strict` <VersionAdd>1.1</VersionAdd>|获取准确的目录概要 (注意：巨大的文件树可能会花费很长的时间) (默认：false)|
 |`--raw`|显示内部原始信息 (默认：false)|
+|`--objects-only`|只显示文件的 chunk 或对象，不查询路径、存储类型和锁；查询硬链接很多的文件的路径会列出每个链接的所有上级目录 (默认：false)|
 
 ### `juicefs debug` <VersionAdd>1.1</VersionAdd> {#debug}
 

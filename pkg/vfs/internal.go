@@ -295,6 +295,29 @@ type chunkObj struct {
 	Size, Off, Len uint32
 }
 
+// infoTierAndPaths fills an info response's storage tier and the paths of its inode.
+func (v *VFS) infoTierAndPaths(ctx meta.Context, inode Ino, info *InfoResponse) {
+	var attr meta.Attr
+	eno := v.Meta.GetAttr(ctx, inode, &attr)
+	info.Tier = object.Tier{}
+	if eno != 0 {
+		logger.Warnf("GetAttr of %d: %s", inode, eno)
+		info.Tier.ID = 0
+		info.Tier.Sc = "unknown"
+	} else {
+		if t, ok := v.Meta.GetFormat().Tiers[attr.Tier]; ok {
+			info.Tier.ID = t.ID
+			info.Tier.Sc = t.Sc
+			info.Tier.Tag = t.Tag
+		} else {
+			logger.Warnf("unknown tier id %d of inode %d", attr.Tier, inode)
+			info.Tier.Sc = "unknown"
+			info.Tier.ID = attr.Tier
+		}
+	}
+	info.Paths = v.Meta.GetPaths(ctx, inode)
+}
+
 func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, out io.Writer) {
 	switch cmd {
 	case meta.Rmr:
@@ -431,11 +454,18 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		if r.HasMore() {
 			strict = r.Get8() != 0
 		}
+		// objectsOnly answers with the summary and the chunks or objects alone. Looking up the paths of a file
+		// hard-linked into many directories lists every ancestor directory of each link, which on Redis scans
+		// each directory's whole hash.
+		var objectsOnly bool
+		if r.HasMore() {
+			objectsOnly = r.Get8() != 0
+		}
 
 		done := make(chan struct{})
 		var r syscall.Errno
 		go func() {
-			logger.Infof("Start to get info v2 of %d, recursive=%d", inode, recursive)
+			logger.Infof("Start to get info v2 of %d, recursive=%d, objectsOnly=%t", inode, recursive, objectsOnly)
 			r = v.Meta.GetSummary(ctx, inode, &info.Summary, recursive != 0, strict)
 			close(done)
 		}()
@@ -444,25 +474,9 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 			info.Failed = true
 			info.Reason = r.Error()
 		} else {
-			var attr meta.Attr
-			eno := v.Meta.GetAttr(ctx, inode, &attr)
-			info.Tier = object.Tier{}
-			if eno != 0 {
-				logger.Warnf("GetAttr of %d: %s", inode, eno)
-				info.Tier.ID = 0
-				info.Tier.Sc = "unknown"
-			} else {
-				if t, ok := v.Meta.GetFormat().Tiers[attr.Tier]; ok {
-					info.Tier.ID = t.ID
-					info.Tier.Sc = t.Sc
-					info.Tier.Tag = t.Tag
-				} else {
-					logger.Warnf("unknown tier id %d of inode %d", attr.Tier, inode)
-					info.Tier.Sc = "unknown"
-					info.Tier.ID = attr.Tier
-				}
+			if !objectsOnly {
+				v.infoTierAndPaths(ctx, inode, info)
 			}
-			info.Paths = v.Meta.GetPaths(ctx, inode)
 			if info.Summary.Files == 1 && info.Summary.Dirs == 0 {
 				format := v.Meta.GetFormat() // v.Conf.Format is not refreshed on format reloads
 				for indx := uint64(0); indx*meta.ChunkSize < info.Summary.Length; indx++ {
@@ -479,7 +493,7 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 					}
 				}
 			}
-			if len(info.Objects) > 0 {
+			if len(info.Objects) > 0 && !objectsOnly {
 				var lastObjKey string
 				for i := len(info.Objects) - 1; i >= 0; i-- {
 					if info.Objects[i].Key != "" {
@@ -503,10 +517,12 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 				}
 			}
 
-			var err error
-			if info.PLocks, info.FLocks, err = v.Meta.ListLocks(ctx, inode); err != nil {
-				info.Failed = true
-				info.Reason = err.Error()
+			if !objectsOnly {
+				var err error
+				if info.PLocks, info.FLocks, err = v.Meta.ListLocks(ctx, inode); err != nil {
+					info.Failed = true
+					info.Reason = err.Error()
+				}
 			}
 		}
 		data, err := json.Marshal(info)

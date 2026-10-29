@@ -583,6 +583,7 @@ juicefs info -i 100
 |`--recursive, -r`|get summary of directories recursively (NOTE: it may take a long time for huge trees) (default: false)|
 |`--strict` <VersionAdd>1.1</VersionAdd> |get accurate summary of directories (NOTE: it may take a long time for huge trees) (default: false)|
 |`--raw`|show internal raw information (default: false)|
+|`--objects-only`|show a file's chunks or objects without looking up its paths, storage class or locks; looking up the paths of a file with many hard links lists every ancestor directory of each link (default: false)|
 
 ### `juicefs debug` <VersionAdd>1.1</VersionAdd> {#debug}
 
