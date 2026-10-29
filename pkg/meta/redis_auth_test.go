@@ -20,9 +20,13 @@
 package meta
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"net/url"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -223,4 +227,93 @@ func TestAWSRedisCredentialsRejectsInsecureTLS(t *testing.T) {
 	opt.TLSConfig.InsecureSkipVerify = true
 	_, err = resolveRedisCredentials("aws", opt, redisCredentialFactories{})
 	require.ErrorContains(t, err, "requires a verified rediss://")
+}
+
+type fixedStreamingCredentials struct{ username, password string }
+
+func (c fixedStreamingCredentials) Subscribe(auth.CredentialsListener) (auth.Credentials, auth.UnsubscribeFunc, error) {
+	return auth.NewBasicCredentials(c.username, c.password), func() error { return nil }, nil
+}
+
+// startFakeRedis serves just enough RESP for a client to authenticate and
+// WATCH: HELLO is refused (so the client falls back to AUTH) and every other
+// command answers +OK.
+func startFakeRedis(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				r := bufio.NewReader(conn)
+				for {
+					line, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					var n int
+					if _, err := fmt.Sscanf(line, "*%d", &n); err != nil {
+						return
+					}
+					var args []string
+					for i := 0; i < n; i++ {
+						if _, err := r.ReadString('\n'); err != nil { // $<len>
+							return
+						}
+						arg, err := r.ReadString('\n')
+						if err != nil {
+							return
+						}
+						args = append(args, strings.TrimRight(arg, "\r\n"))
+					}
+					reply := "+OK\r\n"
+					if len(args) > 0 && strings.EqualFold(args[0], "hello") {
+						reply = "-ERR unknown command 'HELLO'\r\n"
+					}
+					if _, err := conn.Write([]byte(reply)); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// A transaction whose WATCH dials a new connection must authenticate it with the
+// client's streaming (Azure Entra) credentials. go-redis v9.18.0 built the
+// transaction without the client's credentials manager, so initializing that
+// connection panicked and the deferred UNWATCH then waited forever on the
+// transaction's sticky pool, leaving a slice uncommitted for good (Azure prod,
+// 2026-10-29).
+func TestRedisWatchOnNewConnWithStreamingCredentials(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:                         startFakeRedis(t),
+		StreamingCredentialsProvider: fixedStreamingCredentials{username: "oid", password: "token"},
+		DisableIdentity:              true,
+		MaxRetries:                   -1,
+	})
+	defer rdb.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("panic: %v", r)
+			}
+		}()
+		done <- rdb.Watch(context.Background(), func(*redis.Tx) error { return nil }, "k")
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("WATCH on a new connection with streaming credentials did not return")
+	}
 }
