@@ -15,6 +15,8 @@ JuiceFS 提供与 HDFS 接口[高度兼容](https://hadoop.apache.org/docs/curre
 
 JuiceFS Hadoop Java SDK 同时兼容 Hadoop 2.x、Hadoop 3.x，以及 Hadoop 生态中的各种主流组件。
 
+SDK 向 Hadoop 声明支持 append 和 concat 路径能力。Concat 不允许将目标路径用作源路径，包括该路径的完整限定形式和相对形式，并会在修改任何文件之前拒绝此类操作。
+
 ### 2. 用户权限
 
 JuiceFS 默认使用本地的「用户／UID」及「用户组／GID」映射，在分布式环境下使用时，为了避免权限问题，请参考[文档](../administration/sync_accounts_between_multiple_hosts.md)将需要使用的「用户／UID」及「用户组／GID」同步到所有 Hadoop 节点。也可以通过定义一个全局的用户和用户组文件使得集群中的所有节点共享权限配置，相关配置请查看[这里](#其它配置)。

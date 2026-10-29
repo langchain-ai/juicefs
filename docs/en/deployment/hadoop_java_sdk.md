@@ -15,6 +15,8 @@ JuiceFS provides [Hadoop-compatible File System](https://hadoop.apache.org/docs/
 
 JuiceFS Hadoop Java SDK is compatible with Hadoop 2.x and Hadoop 3.x. As well as variety of components in Hadoop ecosystem.
 
+The SDK reports append and concat path capabilities to Hadoop. Concat rejects using the target path as a source, including qualified and relative forms of that path, before modifying any files.
+
 ### 2. User permissions
 
 JuiceFS uses local "User/UID" and "Group/GID" mappings by default, and when used in a distributed environment, to avoid permission issues, please refer to [documentation](../administration/sync_accounts_between_multiple_hosts.md) synchronizes the "User/UID" and "Group/GID" that needs to be used to all Hadoop nodes. It is also possible to define a global user and group file to make all nodes in the cluster share the permission configuration. Please see [here](#other-configurations) for related configurations.
