@@ -54,6 +54,7 @@ func (s *stubChunkStore) CheckCache(id uint64, length uint32, handler func(bool,
 }
 func (s *stubChunkStore) UsedMemory() int64                  { return 0 }
 func (s *stubChunkStore) UpdateLimit(upload, download int64) {}
+func (s *stubChunkStore) SetHashPrefixFromSlice(id uint64)   {}
 func (s *stubChunkStore) BlobStorage() object.ObjectStorage  { return nil }
 
 // A reader that returns (0, nil) leaves readSlice's loop unable to advance. Without a guard the

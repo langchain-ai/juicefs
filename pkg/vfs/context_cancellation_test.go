@@ -51,6 +51,7 @@ func (s *blockingChunkStore) CheckCache(id uint64, length uint32, handler func(b
 }
 func (s *blockingChunkStore) UsedMemory() int64                  { return 0 }
 func (s *blockingChunkStore) UpdateLimit(upload, download int64) {}
+func (s *blockingChunkStore) SetHashPrefixFromSlice(id uint64)   {}
 func (s *blockingChunkStore) BlobStorage() object.ObjectStorage  { return nil }
 
 func createCancellationTestReader(t *testing.T, store chunk.ChunkStore) (*dataReader, Ino) {

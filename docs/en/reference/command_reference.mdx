@@ -221,6 +221,9 @@ juicefs config redis://localhost --trash-days 7
 
 # Limit client version that is allowed to connect
 juicefs config redis://localhost --min-client-version 1.0.0 --max-client-version 1.1.0
+
+# Store slices from id 2000000000 on under hash-prefixed object keys (once; it cannot be undone)
+juicefs config redis://localhost --hash-prefix-from-slice 2000000000
 ```
 
 #### Options
@@ -245,6 +248,7 @@ juicefs config redis://localhost --min-client-version 1.0.0 --max-client-version
 |`--download-limit=0`|bandwidth limit for download in Mbps (default: 0)|
 |`--max-uploads=20`|maximum number of concurrent uploads (default: 20)|
 |`--max-downloads=200` <VersionAdd>1.4</VersionAdd>|maximum number of concurrent downloads (default: 200)|
+|`--hash-prefix-from-slice=N`|Store the slices with ID >= N under hash-prefixed object keys, as [`--hash-prefix`](#format-data-format-options) does for a whole volume, on a volume that was formatted without it. Older slices keep their keys, so nothing is copied. Use it when sequential keys hit the object storage's per-key-range limits (for example GCS 429 "request distribution is too uneven across the key-ranges").<br/><br/>It can be set only once and never changed or cleared. N must be at least the next slice ID plus a margin (about 1M IDs plus 8192 per connected client), so that every client reloads the format before any slice reaches N; the error message gives the smallest allowed value. The command refuses while any connected client is older than 1.4.2-A, checks again right before it writes the format, and raises `--min-client-version` to 1.4.2-A so older clients cannot mount the volume afterwards. Clients that run without a session (`juicefs gc`, `juicefs sync` with `jfs://`, the Java SDK with `NoSession`) are not visible to that check: stop or upgrade older ones before running it. Run later `juicefs config` and `juicefs format` commands on this volume only with a client that supports it: an older one rewrites the format without the threshold.|
 
 #### Management options {#config-management-options}
 

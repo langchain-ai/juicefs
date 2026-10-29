@@ -81,7 +81,7 @@ type cacheStore struct {
 	capacity      int64
 	maxItems      int64
 	freeRatio     float32
-	hashPrefix    bool
+	layout        *keyLayout
 	scanInterval  time.Duration
 	cacheExpire   time.Duration
 	pending       chan pendingFile
@@ -129,7 +129,7 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 		maxStageWrite:       config.MaxStageWrite,
 		freeRatio:           config.FreeSpace,
 		checksum:            config.CacheChecksum,
-		hashPrefix:          config.HashPrefix,
+		layout:              config.keyLayout(),
 		scanInterval:        config.CacheScanInterval,
 		cacheExpire:         config.CacheExpire,
 		keys:                keyIndex,
@@ -632,11 +632,7 @@ func (cache *cacheStore) getCacheKey(key string) cacheKey {
 }
 
 func (cache *cacheStore) getPathFromKey(k cacheKey) string {
-	if cache.hashPrefix {
-		return fmt.Sprintf("chunks/%02X/%v/%v_%v_%v", k.id%256, k.id/1000/1000, k.id, k.indx, k.size)
-	} else {
-		return fmt.Sprintf("chunks/%v/%v/%v_%v_%v", k.id/1000/1000, k.id/1000, k.id, k.indx, k.size)
-	}
+	return cache.layout.key(k.id, int(k.indx), int(k.size))
 }
 
 func (cache *cacheStore) remove(key string, staging bool) {

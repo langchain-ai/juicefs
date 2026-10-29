@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -118,6 +119,11 @@ func fsck(ctx *cli.Context) error {
 		}
 	}
 	sliceCSpin.Done()
+	// Slices listed above may be newer than the format loaded before the listing: take the hash-prefix threshold
+	// from a format loaded after it.
+	if f, err := m.Load(false); err == nil {
+		format.HashPrefixFromSlice = f.HashPrefixFromSlice
+	}
 
 	chunkConf := *getDefaultChunkConf(format)
 	chunkConf.CacheDir = "memory"
@@ -186,12 +192,7 @@ func fsck(ctx *cli.Context) error {
 				}
 				key := fmt.Sprintf("%d_%d_%d", s.Id, i, sz)
 				if _, ok := blocks[key]; !ok {
-					var objKey string
-					if format.HashPrefix {
-						objKey = fmt.Sprintf("%02X/%v/%s", s.Id%256, s.Id/1000/1000, key)
-					} else {
-						objKey = fmt.Sprintf("%v/%v/%s", s.Id/1000/1000, s.Id/1000, key)
-					}
+					objKey := strings.TrimPrefix(chunk.BlockKey(s.Id, int(i), sz, format.HashPrefix, format.HashPrefixFromSlice), "chunks/")
 					obj, err := blob.Head(ctx.Context, objKey)
 					if err != nil {
 						if _, ok := brokens[inode]; !ok {

@@ -279,6 +279,7 @@ func initForSvc(c *cli.Context, mp string, svcType, metaUrl, listenAddr string) 
 	metaCli.OnReload(func(fmt *meta.Format) {
 		updateFormat(c)(fmt)
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
+		store.SetHashPrefixFromSlice(fmt.HashPrefixFromSlice)
 	})
 
 	// Go will catch all the signals

@@ -697,6 +697,7 @@ func jfs_init(credentialPtr uintptr, count int32, cname, cjsonConf, cuser, group
 			BufferSize:        utils.ParseBytesStr("memory-size", jConf.MemorySize, 'M'),
 			Readahead:         int(utils.ParseBytesStr("max-readahead", jConf.Readahead, 'M')),
 		}
+		chunkConf.HashPrefixFromSlice = format.HashPrefixFromSlice
 		if chunkConf.UploadLimit == 0 {
 			chunkConf.UploadLimit = format.UploadLimit * 1e6 / 8
 		}
@@ -729,6 +730,7 @@ func jfs_init(credentialPtr uintptr, count int32, cname, cjsonConf, cuser, group
 				fmt.DownloadLimit = chunkConf.DownloadLimit
 			}
 			store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
+			store.SetHashPrefixFromSlice(fmt.HashPrefixFromSlice)
 		})
 
 		conf := &vfs.Config{

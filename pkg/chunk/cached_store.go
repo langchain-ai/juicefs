@@ -72,10 +72,7 @@ func (s *rSlice) blockSize(indx int) int {
 }
 
 func (s *rSlice) key(indx int) string {
-	if s.store.conf.HashPrefix {
-		return fmt.Sprintf("chunks/%02X/%v/%v_%v_%v", s.id%256, s.id/1000/1000, s.id, indx, s.blockSize(indx))
-	}
-	return fmt.Sprintf("chunks/%v/%v/%v_%v_%v", s.id/1000/1000, s.id/1000, s.id, indx, s.blockSize(indx))
+	return s.store.conf.layout.key(s.id, indx, s.blockSize(indx))
 }
 
 func (s *rSlice) index(off int) int {
@@ -561,6 +558,10 @@ type Config struct {
 	Readahead              int
 	Prefetch               int
 
+	// HashPrefixFromSlice gives slices with id >= it hash-prefixed keys on a volume without HashPrefix (0 = none). It
+	// is the value at mount; SetHashPrefixFromSlice turns it on later.
+	HashPrefixFromSlice uint64
+
 	// CacheGroupPeers lists the members of this client's cache group: comma-separated host:port addresses, or
 	// dns:<name>:<port> to resolve them (e.g. a headless Service). Empty disables the cache group.
 	CacheGroupPeers string
@@ -576,6 +577,17 @@ type Config struct {
 	// CacheGroupReplicas is how many members own each block (default 1). With 2, a block survives one owner's restart
 	// and its reads are shared by two owners, while object storage is still read about once per block.
 	CacheGroupReplicas int
+
+	layout *keyLayout // shared by the store and its caches, see keyLayout
+}
+
+// keyLayout returns the key layout that a store and its caches share, creating it from HashPrefix and
+// HashPrefixFromSlice on first use.
+func (c *Config) keyLayout() *keyLayout {
+	if c.layout == nil {
+		c.layout = newKeyLayout(c.HashPrefix, c.HashPrefixFromSlice)
+	}
+	return c.layout
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -912,6 +924,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 	if config.PutTimeout == 0 {
 		config.PutTimeout = time.Second * 60
 	}
+	config.keyLayout()
 	store := &cachedStore{
 		storage:         storage,
 		conf:            config,
@@ -1328,6 +1341,12 @@ func (store *cachedStore) CheckCache(id uint64, length uint32, handler func(exis
 
 func (store *cachedStore) UsedMemory() int64 {
 	return store.bcache.usedMemory()
+}
+
+// SetHashPrefixFromSlice turns on hash-prefixed keys for slices with id >= id, on a format reload. Only the first
+// non-zero value is taken, see keyLayout.setHashFrom.
+func (store *cachedStore) SetHashPrefixFromSlice(id uint64) {
+	store.conf.layout.setHashFrom(id)
 }
 
 func (store *cachedStore) UpdateLimit(upload, download int64) {

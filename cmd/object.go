@@ -481,15 +481,16 @@ func (j *juiceFS) CompleteUpload(rCtx context.Context, key string, uploadID stri
 
 func getDefaultChunkConf(format *meta.Format) *chunk.Config {
 	chunkConf := &chunk.Config{
-		BlockSize:   format.BlockSize * 1024,
-		Compress:    format.Compression,
-		HashPrefix:  format.HashPrefix,
-		GetTimeout:  time.Minute,
-		PutTimeout:  time.Minute,
-		MaxUpload:   50,
-		MaxDownload: 200,
-		MaxRetries:  10,
-		BufferSize:  300 << 20,
+		BlockSize:           format.BlockSize * 1024,
+		Compress:            format.Compression,
+		HashPrefix:          format.HashPrefix,
+		HashPrefixFromSlice: format.HashPrefixFromSlice,
+		GetTimeout:          time.Minute,
+		PutTimeout:          time.Minute,
+		MaxUpload:           50,
+		MaxDownload:         200,
+		MaxRetries:          10,
+		BufferSize:          300 << 20,
 	}
 	chunkConf.SelfCheck(format.UUID)
 	return chunkConf
@@ -530,6 +531,7 @@ func newJFS(endpoint, accessKey, secretKey, token string) (object.ObjectStorage,
 	}
 	metaCli.OnReload(func(fmt *meta.Format) {
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
+		store.SetHashPrefixFromSlice(fmt.HashPrefixFromSlice)
 	})
 
 	vfsConf := &vfs.Config{

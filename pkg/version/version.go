@@ -26,11 +26,14 @@ import (
 var (
 	revision     = "$Format:%h$" // value is assigned in Makefile
 	revisionDate = "$Format:%as$"
-	ver          = Semver{
+	// The langchain fork reports 1.4.2-lc, not upstream's 1.4.1: a volume with hash-prefix-from-slice only admits
+	// clients >= 1.4.2-A (cmd/config.go), and CompareVersions ranks 1.4.1 above every 1.4.1-<pre-release>, so only a
+	// higher patch number can keep the fork builds without that feature from mounting it.
+	ver = Semver{
 		major:      1,
 		minor:      4,
-		patch:      1,
-		preRelease: "",
+		patch:      2,
+		preRelease: "lc",
 		build:      fmt.Sprintf("%s.%s", revisionDate, revision),
 	}
 )

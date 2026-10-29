@@ -110,6 +110,10 @@ type Format struct {
 
 	//kerberos
 	KerbConf string `json:",omitempty"`
+
+	// HashPrefixFromSlice gives slices with id >= it hash-prefixed object keys on a volume formatted without
+	// HashPrefix (0 = none). Set once by `juicefs config --hash-prefix-from-slice`; it never changes afterwards.
+	HashPrefixFromSlice uint64 `json:",omitempty"`
 }
 
 func (f *Format) update(old *Format, force bool) error {
@@ -128,6 +132,8 @@ func (f *Format) update(old *Format, force bool) error {
 			args = []interface{}{"shards", old.Shards, f.Shards}
 		case f.HashPrefix != old.HashPrefix:
 			args = []interface{}{"hash prefix", old.HashPrefix, f.HashPrefix}
+		case old.HashPrefixFromSlice != 0 && f.HashPrefixFromSlice != old.HashPrefixFromSlice:
+			args = []interface{}{"hash prefix from slice", old.HashPrefixFromSlice, f.HashPrefixFromSlice}
 		case f.MetaVersion != old.MetaVersion:
 			args = []interface{}{"meta version", old.MetaVersion, f.MetaVersion}
 		}
