@@ -15,6 +15,7 @@
  */
 package io.juicefs;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.kenai.jffi.internal.StubLoader;
 import io.juicefs.exception.QuotaExceededException;
@@ -355,6 +356,19 @@ public class JuiceFileSystemImpl extends FileSystem {
   @Override
   public String getScheme() {
     return uri.getScheme();
+  }
+
+  public boolean hasPathCapability(Path path, String capability) throws IOException {
+    Preconditions.checkArgument(path != null, "null path");
+    makeQualified(path);
+    Preconditions.checkArgument(capability != null && !capability.isEmpty(), "Invalid capability");
+    switch (capability.toLowerCase(Locale.ENGLISH)) {
+      case "fs.capability.paths.append":
+      case "fs.capability.paths.concat":
+        return true;
+      default:
+        return false;
+    }
   }
 
   @Override
@@ -1607,6 +1621,9 @@ public class JuiceFileSystemImpl extends FileSystem {
     }
     Path dp = makeQualified(dst).getParent();
     for (Path src : srcs) {
+      if (normalizePath(src).equals(normalizePath(dst))) {
+        throw new HadoopIllegalArgumentException("Source file is the same as the target: " + dst);
+      }
       if (!makeQualified(src).getParent().equals(dp)) {
         throw new HadoopIllegalArgumentException("Source file " + normalizePath(src)
                 + " is not in the same directory with the target "

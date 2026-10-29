@@ -4,9 +4,9 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -588,6 +588,20 @@ public class JuiceFileSystemTest extends TestCase {
     assertEquals(5, append.getPos());
   }
 
+  public void testPathCapabilities() throws IOException {
+    JuiceFileSystemImpl impl = (JuiceFileSystemImpl) ((JuiceFileSystem) fs).getRawFileSystem();
+    assertTrue(impl.hasPathCapability(new Path("/"), "FS.CAPABILITY.PATHS.APPEND"));
+    assertTrue(impl.hasPathCapability(new Path("/"), "fs.capability.paths.concat"));
+    assertFalse(impl.hasPathCapability(new Path("/"), "fs.capability.paths.unknown"));
+    for (String capability : new String[]{null, ""}) {
+      try {
+        impl.hasPathCapability(new Path("/"), capability);
+        fail("Invalid capability must be rejected");
+      } catch (IllegalArgumentException expected) {
+      }
+    }
+  }
+
   public void testFlinkHadoopRecoverableWriter() throws Exception {
     new HadoopRecoverableWriter(fs);
   }
@@ -605,6 +619,19 @@ public class JuiceFileSystemTest extends TestCase {
     FSDataOutputStream sou2 = fs.create(src2);
     sou2.write("hello".getBytes());
     sou2.close();
+    for (Path self : new Path[]{trg, fs.makeQualified(trg), new Path(trg.toUri().getPath().substring(1))}) {
+      Path workingDir = fs.getWorkingDirectory();
+      fs.setWorkingDirectory(new Path("/"));
+      try {
+        fs.concat(trg, new Path[]{src1, self});
+        fail("concat must reject the target as a source");
+      } catch (IllegalArgumentException expected) {
+        assertEquals(5, fs.getFileStatus(trg).getLen());
+        assertTrue(fs.exists(src1));
+      } finally {
+        fs.setWorkingDirectory(workingDir);
+      }
+    }
     fs.concat(trg, new Path[]{src1, src2});
     FSDataInputStream in = fs.open(trg);
     assertEquals("hellohellohello", IOUtils.toString(in));
@@ -1264,18 +1291,18 @@ public class JuiceFileSystemTest extends TestCase {
     Path subdir1 = new Path("/subdir1");
     Path subdir2 = new Path("/subdir2");
     Path subdir3 = new Path("/subdir3");
-    
+
     fs.delete(subdir1, true);
     fs.delete(subdir2, true);
     fs.delete(subdir3, true);
-    
+
     fs.mkdirs(subdir1);
     fs.mkdirs(subdir2);
     fs.mkdirs(subdir3);
     fs.setPermission(subdir1, new FsPermission((short) 0777));
     fs.setPermission(subdir2, new FsPermission((short) 0777));
     fs.setPermission(subdir3, new FsPermission((short) 0777));
-    
+
     // Set multiple subdirs separated by comma
     newConf.set("juicefs.subdir", "/subdir1,/subdir2,/subdir3");
     FileSystem newFS = FileSystem.newInstance(newConf);
