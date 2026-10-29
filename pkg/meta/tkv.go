@@ -3110,7 +3110,7 @@ func (m *kvMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 	return count, nil
 }
 
-func (m *kvMeta) doCompactChunk(inode Ino, indx uint32, buf []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
+func (m *kvMeta) doCompactChunk(inode Ino, indx uint32, buf []byte, ss []*slice, skipped int, pos uint32, entries []byte, id uint64, size uint32, refs int, delayed []byte) syscall.Errno {
 	st := errno(m.txn(Background(), func(tx *kvTxn) error {
 		buf2 := tx.get(m.chunkKey(inode, indx))
 		if len(buf2) < len(buf) || !bytes.Equal(buf, buf2[:len(buf)]) {
@@ -3118,10 +3118,12 @@ func (m *kvMeta) doCompactChunk(inode Ino, indx uint32, buf []byte, ss []*slice,
 			return syscall.EINVAL
 		}
 
-		buf2 = append(append(buf2[:skipped*sliceBytes], marshalSlice(pos, id, size, 0, size)...), buf2[len(buf):]...)
+		// A fresh buffer: entries can be longer than the entries they replace.
+		buf2 = append(append(append(make([]byte, 0, len(buf2)-len(buf)+skipped*sliceBytes+len(entries)),
+			buf2[:skipped*sliceBytes]...), entries...), buf2[len(buf):]...)
 		tx.set(m.chunkKey(inode, indx), buf2)
 		// create the key to tracking it
-		tx.set(m.sliceKey(id, size), make([]byte, 8))
+		tx.set(m.sliceKey(id, size), packCounter(int64(refs-1)))
 		if delayed != nil {
 			if len(delayed) > 0 {
 				tx.set(m.delSliceKey(time.Now().Unix(), id), delayed)
@@ -3158,8 +3160,13 @@ func (m *kvMeta) doCompactChunk(inode Ino, indx uint32, buf []byte, ss []*slice,
 		m.cleanupZeroRef(id, size)
 		if delayed == nil {
 			var refs int64
+			seen := make(map[uint64]bool) // a slice can appear in several entries
 			for _, s := range ss {
-				if s.id > 0 && m.client.txn(Background(), func(tx *kvTxn) error {
+				if s.id == 0 || seen[s.id] {
+					continue
+				}
+				seen[s.id] = true
+				if m.client.txn(Background(), func(tx *kvTxn) error {
 					refs = tx.incrBy(m.sliceKey(s.id, s.size), 0)
 					return nil
 				}, 0) == nil && refs < 0 {
@@ -4490,21 +4497,26 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 						return true
 					})
 
-				refKeys := make([][]byte, 0, len(vals))
+				// A slice can appear in several entries; each one is a reference.
+				refCounts := make(map[string]int64)
 				for indx := uint32(0); indx <= uint32(attr.Length/ChunkSize); indx++ {
 					if v, ok := vals[string(m.chunkKey(srcIno, indx))]; ok {
 						tx.set(m.chunkKey(ino, indx), v)
 						ss := readSliceBuf(v)
 						for _, s := range ss {
 							if s.id > 0 {
-								refKeys = append(refKeys, m.sliceKey(s.id, s.size))
+								refCounts[string(m.sliceKey(s.id, s.size))]++
 							}
 						}
 					}
 				}
+				refKeys := make([][]byte, 0, len(refCounts))
+				for k := range refCounts {
+					refKeys = append(refKeys, []byte(k))
+				}
 				refs := tx.gets(refKeys...)
-				for i := range refKeys {
-					tx.set(refKeys[i], packCounter(parseCounter(refs[i])+1))
+				for i, k := range refKeys {
+					tx.set(k, packCounter(parseCounter(refs[i])+refCounts[string(k)]))
 				}
 			}
 		case TypeSymlink:
