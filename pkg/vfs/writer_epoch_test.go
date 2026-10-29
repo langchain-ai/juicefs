@@ -1713,39 +1713,61 @@ func TestEpochFailedUploadDropsTheEpochAndEveryNewerOne(t *testing.T) {
 // removed. A commit whose outcome the writer cannot know (EIO) may have landed: its objects are kept, and every newer
 // epoch is dropped with its objects.
 func TestEpochFailedCommit(t *testing.T) {
-	t.Run("ENOSPC", func(t *testing.T) {
-		v, store, rec := createEpochTestVFS(t, "", nil)
-		ino, fh := newRangeTestFile(t, v)
-		extendPastChunks(t, v, ino, fh, 4) // commit 1
-		rec.mu.Lock()
-		rec.inject = func(call int) (syscall.Errno, bool) {
-			if call == 2 {
-				return syscall.ENOSPC, false
+	// A refused commit: the objects are removed and the error sticks. ENOENT (the file was deleted with writes pending)
+	// is counted apart from the failures, so that an alert on failed epochs does not fire for deleted files.
+	for _, tc := range []struct {
+		st      syscall.Errno
+		handle  syscall.Errno // what fsync and write on the handle return: the VFS reports ENOENT as EBADF
+		outcome string
+	}{{syscall.ENOSPC, syscall.ENOSPC, "failed"}, {syscall.ENOENT, syscall.EBADF, "deleted"}} {
+		t.Run(tc.st.Error(), func(t *testing.T) {
+			waitWriterIdle(t) // no other file's epoch moves the metrics
+			v, store, rec := createEpochTestVFS(t, "", nil)
+			ino, fh := newRangeTestFile(t, v)
+			extendPastChunks(t, v, ino, fh, 4) // commit 1
+			outcomes := map[string]float64{}
+			for _, o := range epochOutcomes {
+				outcomes[o] = counterValue(t, writerEpochs.WithLabelValues(o))
 			}
-			return 0, false
-		}
-		rec.mu.Unlock()
-		mustWrite(t, v, ino, fh, 0, []byte("zero"))
-		mustWrite(t, v, ino, fh, meta.ChunkSize, []byte("one"))
-		ids := []uint64{waitSliceIDAt(t, v, ino, 0, 0), waitSliceIDAt(t, v, ino, 1, 0)}
-		if e := v.Fsync(NewLogContext(meta.Background()), ino, 0, fh); e != syscall.ENOSPC {
-			t.Fatalf("fsync: %v, want ENOSPC", e)
-		}
-		for _, id := range ids {
-			keys := store.keysOf(id)
-			if len(keys) == 0 {
-				t.Fatalf("slice %d was not uploaded", id)
+			rec.mu.Lock()
+			rec.inject = func(call int) (syscall.Errno, bool) {
+				if call == 2 {
+					return tc.st, false
+				}
+				return 0, false
 			}
-			waitUntil(t, 10*time.Second, "the objects of the refused epoch to be removed", func() bool { return store.objectsExist(keys) == 0 })
-		}
-		if e := v.Write(NewLogContext(meta.Background()), ino, []byte("x"), 0, fh); e != syscall.ENOSPC {
-			t.Fatalf("write after the failure: %v, want ENOSPC", e)
-		}
-		if n := len(rec.commitsOf(ino)); n != 1 {
-			t.Fatalf("%d commits, want 1", n)
-		}
-		v.Release(NewLogContext(meta.Background()), ino, fh)
-	})
+			rec.mu.Unlock()
+			mustWrite(t, v, ino, fh, 0, []byte("zero"))
+			mustWrite(t, v, ino, fh, meta.ChunkSize, []byte("one"))
+			ids := []uint64{waitSliceIDAt(t, v, ino, 0, 0), waitSliceIDAt(t, v, ino, 1, 0)}
+			if e := v.Fsync(NewLogContext(meta.Background()), ino, 0, fh); e != tc.handle {
+				t.Fatalf("fsync: %v, want %v", e, tc.handle)
+			}
+			for _, id := range ids {
+				keys := store.keysOf(id)
+				if len(keys) == 0 {
+					t.Fatalf("slice %d was not uploaded", id)
+				}
+				waitUntil(t, 10*time.Second, "the objects of the refused epoch to be removed", func() bool { return store.objectsExist(keys) == 0 })
+			}
+			if e := v.Write(NewLogContext(meta.Background()), ino, []byte("x"), 0, fh); e != tc.handle {
+				t.Fatalf("write after the failure: %v, want %v", e, tc.handle)
+			}
+			if n := len(rec.commitsOf(ino)); n != 1 {
+				t.Fatalf("%d commits, want 1", n)
+			}
+			for _, o := range epochOutcomes {
+				want := 0.0
+				if o == tc.outcome {
+					want = 1
+				}
+				if d := counterValue(t, writerEpochs.WithLabelValues(o)) - outcomes[o]; o != "committed" && d != want {
+					t.Fatalf("%v epochs %s, want %v", d, o, want)
+				}
+			}
+			v.Release(NewLogContext(meta.Background()), ino, fh)
+		})
+	}
 	t.Run("EIO", func(t *testing.T) {
 		readFlushRange(t, true) // reads close epochs while writes go on
 		waitWriterIdle(t)       // no other file's epoch moves the metrics

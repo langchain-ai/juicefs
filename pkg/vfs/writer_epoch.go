@@ -131,8 +131,8 @@ func (f *fileWriter) chunksToFreeze() map[uint32]*chunkWriter {
 var (
 	writerEpochs = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "writer_epochs_total",
-		Help: "Epochs handled by the writer: outcome committed, failed (an upload or the commit failed), or abandoned " +
-			"(an older epoch of the same file failed).",
+		Help: "Epochs handled by the writer: outcome committed, failed (an upload or the commit failed), deleted (the " +
+			"commit found the file deleted, ENOENT), or abandoned (an older epoch of the same file failed or was deleted).",
 	}, []string{"outcome"})
 	writerEpochClosed = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "writer_epoch_closed_total",
@@ -214,7 +214,7 @@ var (
 )
 
 var (
-	epochOutcomes     = []string{"committed", "failed", "abandoned"}
+	epochOutcomes     = []string{"committed", "failed", "deleted", "abandoned"}
 	epochCloseReasons = []string{"age", "idle", "flush", "read", "cap", "buffer", "error"}
 	epochCommitModes  = []string{"multi", "sequential"}
 	sliceCapReasons   = []string{"buffered", "gated"}
@@ -540,6 +540,9 @@ func (f *fileWriter) commitEpochs() {
 			remove = slices
 		case st != 0:
 			outcome = "failed"
+			if st == syscall.ENOENT {
+				outcome = "deleted" // the file was removed with writes still pending: nothing is left to read them
+			}
 			f.fail(e, st)
 			if commitDidNotLand(st, !sequential) {
 				remove = slices[landed:]
