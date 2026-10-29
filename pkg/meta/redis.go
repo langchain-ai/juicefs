@@ -106,6 +106,17 @@ func init() {
 	Register("unix", newRedisMeta)
 }
 
+// setRedisDialDefaults makes one dial attempt per new connection unless the URL
+// sets dialer_retries. go-redis applies DialTimeout to each attempt, so its
+// default of five would let a dial that never completes (a blackholed address,
+// a hung DNS lookup) hold a metadata call for five timeouts; command and
+// transaction retries already retry failed dials.
+func setRedisDialDefaults(opt *redis.Options) {
+	if opt.DialerRetries == 0 {
+		opt.DialerRetries = 1
+	}
+}
+
 // newRedisMeta return a meta store using Redis.
 func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	uri := driver + "://" + addr
@@ -189,6 +200,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	}
 	opt.MinRetryBackoff = minRetryBackoff
 	opt.MaxRetryBackoff = maxRetryBackoff
+	setRedisDialDefaults(opt)
 	opt.ReadTimeout = readTimeout
 	opt.WriteTimeout = writeTimeout
 	opt.MaintNotificationsConfig = &maintnotifications.Config{Mode: maintnotifications.ModeDisabled}
@@ -223,6 +235,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 		fopt.MinRetryBackoff = opt.MinRetryBackoff
 		fopt.MaxRetryBackoff = opt.MaxRetryBackoff
 		fopt.DialTimeout = opt.DialTimeout
+		fopt.DialerRetries = opt.DialerRetries
 		fopt.ReadTimeout = opt.ReadTimeout
 		fopt.WriteTimeout = opt.WriteTimeout
 		fopt.PoolFIFO = opt.PoolFIFO               // default: false
@@ -262,6 +275,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 			copt.MinRetryBackoff = opt.MinRetryBackoff
 			copt.MaxRetryBackoff = opt.MaxRetryBackoff
 			copt.DialTimeout = opt.DialTimeout
+			copt.DialerRetries = opt.DialerRetries
 			copt.ReadTimeout = opt.ReadTimeout
 			copt.WriteTimeout = opt.WriteTimeout
 			copt.PoolFIFO = opt.PoolFIFO               // default: false

@@ -317,3 +317,31 @@ func TestRedisWatchOnNewConnWithStreamingCredentials(t *testing.T) {
 		t.Fatal("WATCH on a new connection with streaming credentials did not return")
 	}
 }
+
+// A dial that never completes (a blackholed address, a hung DNS lookup) must
+// give up after one DialTimeout. go-redis applies DialTimeout to each dial
+// attempt, so its default of five attempts would hold a metadata call for five
+// timeouts before command and transaction retries even start.
+func TestRedisHungDialFailsWithinDialTimeout(t *testing.T) {
+	opt, err := redis.ParseURL("redis://localhost:6379/1?dial_timeout=200ms")
+	require.NoError(t, err)
+	setRedisDialDefaults(opt)
+	opt.MaxRetries = -1
+	opt.Dialer = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	rdb := redis.NewClient(opt)
+	defer rdb.Close()
+
+	start := time.Now()
+	require.Error(t, rdb.Ping(context.Background()).Err())
+	require.Less(t, time.Since(start), 2*opt.DialTimeout)
+}
+
+func TestSetRedisDialDefaultsKeepsURLDialerRetries(t *testing.T) {
+	opt, err := redis.ParseURL("redis://localhost:6379/1?dialer_retries=3")
+	require.NoError(t, err)
+	setRedisDialDefaults(opt)
+	require.Equal(t, 3, opt.DialerRetries)
+}
